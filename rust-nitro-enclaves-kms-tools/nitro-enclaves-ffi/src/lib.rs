@@ -213,11 +213,28 @@ pub struct KmsClient {
 
 impl KmsClient {
     pub fn new(config: KmsClientConfig) -> Result<Self> {
+        eprintln!("KmsClient::new - Creating KMS client");
+        
         unsafe {
             let client = aws_nitro_enclaves_kms_client_new(config.config);
+            eprintln!("KmsClient::new - Client pointer: {:?}", client);
+            
             if client.is_null() {
+                eprintln!("KmsClient::new - ERROR: Client is null!");
+                // Try to get AWS error
+                let error_code = aws_last_error();
+                eprintln!("KmsClient::new - AWS last error code: {}", error_code);
+                if error_code != 0 {
+                    let error_str = aws_error_debug_str(error_code, ptr::null_mut());
+                    if !error_str.is_null() {
+                        let c_str = std::ffi::CStr::from_ptr(error_str);
+                        eprintln!("KmsClient::new - AWS error: {:?}", c_str);
+                    }
+                }
                 return Err(NitroEnclavesError::NullPointer);
             }
+            
+            eprintln!("KmsClient::new - Client created successfully");
             Ok(Self { client })
         }
     }
@@ -229,6 +246,9 @@ impl KmsClient {
         ciphertext: &AwsByteBuffer,
         plaintext: &mut AwsByteBuffer,
     ) -> Result<()> {
+        eprintln!("KmsClient::decrypt - Starting decrypt operation");
+        eprintln!("KmsClient::decrypt - Ciphertext size: {}", ciphertext.len());
+        
         unsafe {
             let result = aws_kms_decrypt_blocking(
                 self.client,
@@ -238,9 +258,24 @@ impl KmsClient {
                 plaintext.as_mut_ptr(),
             );
             
+            eprintln!("KmsClient::decrypt - Result: {}", result);
+            
             if result != 0 {
+                eprintln!("KmsClient::decrypt - ERROR: Decrypt failed with code {}", result);
+                // Try to get more error info
+                let error_code = aws_last_error();
+                eprintln!("KmsClient::decrypt - AWS last error code: {}", error_code);
+                if error_code != 0 {
+                    let error_str = aws_error_debug_str(error_code, ptr::null_mut());
+                    if !error_str.is_null() {
+                        let c_str = std::ffi::CStr::from_ptr(error_str);
+                        eprintln!("KmsClient::decrypt - AWS error: {:?}", c_str);
+                    }
+                }
                 return Err(NitroEnclavesError::AwsError(result));
             }
+            
+            eprintln!("KmsClient::decrypt - Success, plaintext size: {}", plaintext.len());
             Ok(())
         }
     }
@@ -322,6 +357,11 @@ impl Drop for KmsClient {
 // KMS Client Configuration wrapper
 pub struct KmsClientConfig {
     config: *mut aws_nitro_enclaves_kms_client_configuration,
+    // Keep references to strings to ensure they don't get dropped
+    _region: Option<AwsString>,
+    _access_key: Option<AwsString>,
+    _secret_key: Option<AwsString>,
+    _session_token: Option<AwsString>,
 }
 
 impl KmsClientConfig {
@@ -364,6 +404,131 @@ impl KmsClientConfig {
             }
             
             Ok(Self { config })
+        }
+    }
+    
+    pub fn vsock(
+        region: &AwsString,
+        access_key_id: &AwsString,
+        secret_access_key: &AwsString,
+        session_token: Option<&AwsString>,
+        vsock_cid: &str,
+        port: u16,
+    ) -> Result<Self> {
+        eprintln!("KmsClientConfig::vsock - Creating vsock config with CID: {}, port: {}", vsock_cid, port);
+        
+        unsafe {
+            // Create vsock endpoint
+            let mut socket_endpoint: aws_socket_endpoint = std::mem::zeroed();
+            let cid_cstring = CString::new(vsock_cid).unwrap();
+            let cid_bytes = cid_cstring.as_bytes_with_nul();
+            // Copy the CID string to the address array
+            let copy_len = cid_bytes.len().min(socket_endpoint.address.len());
+            ptr::copy_nonoverlapping(
+                cid_bytes.as_ptr() as *const i8,
+                socket_endpoint.address.as_mut_ptr(),
+                copy_len
+            );
+            socket_endpoint.port = port;
+            
+            eprintln!("KmsClientConfig::vsock - Socket endpoint: address={:?}, port={}", 
+                std::str::from_utf8(&socket_endpoint.address[..copy_len-1]).unwrap_or("invalid"), 
+                socket_endpoint.port);
+            
+            // Use domain value 3 for AWS_SOCKET_VSOCK
+            let config = aws_nitro_enclaves_kms_client_config_default(
+                region.as_ptr() as *mut _,
+                &mut socket_endpoint as *mut _,
+                3, // AWS_SOCKET_VSOCK
+                access_key_id.as_ptr() as *mut _,
+                secret_access_key.as_ptr() as *mut _,
+                session_token.map(|s| s.as_ptr() as *mut _).unwrap_or(ptr::null_mut()),
+            );
+            
+            eprintln!("KmsClientConfig::vsock - Config pointer: {:?}", config);
+            
+            if config.is_null() {
+                eprintln!("KmsClientConfig::vsock - ERROR: Config is null!");
+                return Err(NitroEnclavesError::NullPointer);
+            }
+            
+            eprintln!("KmsClientConfig::vsock - Config created successfully");
+            Ok(Self { 
+                config,
+                _region: None,
+                _access_key: None,
+                _secret_key: None,
+                _session_token: None,
+            })
+        }
+    }
+    
+    // Create configuration manually like C version does
+    pub fn vsock_manual(
+        allocator: &AwsAllocator,
+        region: &AwsString,
+        credentials: &AwsCredentials,
+        vsock_cid: &str,
+        port: u16,
+        host_name: Option<&AwsString>,
+    ) -> Result<Self> {
+        eprintln!("KmsClientConfig::vsock_manual - Creating manual vsock config");
+        
+        unsafe {
+            // Allocate configuration structure
+            let config = aws_mem_calloc(
+                allocator.as_ptr(),
+                1,
+                std::mem::size_of::<aws_nitro_enclaves_kms_client_configuration>()
+            ) as *mut aws_nitro_enclaves_kms_client_configuration;
+            
+            if config.is_null() {
+                eprintln!("KmsClientConfig::vsock_manual - Failed to allocate config");
+                return Err(NitroEnclavesError::NullPointer);
+            }
+            
+            // Create vsock endpoint
+            let mut socket_endpoint: aws_socket_endpoint = std::mem::zeroed();
+            let cid_cstring = CString::new(vsock_cid).unwrap();
+            let cid_bytes = cid_cstring.as_bytes_with_nul();
+            let copy_len = cid_bytes.len().min(socket_endpoint.address.len());
+            ptr::copy_nonoverlapping(
+                cid_bytes.as_ptr() as *const i8,
+                socket_endpoint.address.as_mut_ptr(),
+                copy_len
+            );
+            socket_endpoint.port = port;
+            
+            // Allocate persistent endpoint
+            let endpoint_ptr = aws_mem_calloc(
+                allocator.as_ptr(),
+                1,
+                std::mem::size_of::<aws_socket_endpoint>()
+            ) as *mut aws_socket_endpoint;
+            
+            if endpoint_ptr.is_null() {
+                aws_mem_release(allocator.as_ptr(), config as *mut _);
+                return Err(NitroEnclavesError::NullPointer);
+            }
+            
+            *endpoint_ptr = socket_endpoint;
+            
+            // Set fields like C version
+            (*config).allocator = allocator.as_ptr();
+            (*config).region = region.as_ptr();
+            (*config).endpoint = endpoint_ptr;
+            (*config).domain = 3; // AWS_SOCKET_VSOCK
+            (*config).credentials = credentials.as_ptr();
+            (*config).host_name = host_name.map(|h| h.as_ptr()).unwrap_or(ptr::null());
+            
+            eprintln!("KmsClientConfig::vsock_manual - Config created successfully");
+            Ok(Self { 
+                config,
+                _region: None,
+                _access_key: None,
+                _secret_key: None,
+                _session_token: None,
+            })
         }
     }
 }

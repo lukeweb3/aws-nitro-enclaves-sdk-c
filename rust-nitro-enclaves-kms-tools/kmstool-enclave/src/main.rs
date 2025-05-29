@@ -112,60 +112,110 @@ impl Server {
     }
     
     fn create_kms_client(&self) -> Result<KmsClient> {
+        info!("Creating KMS client");
+        
         let client_info = self.client_info.lock().unwrap();
         let info = client_info.as_ref().ok_or(ServerError::ClientNotSet)?;
         
-        let allocator = AwsAllocator::default()?;
-        let region = AwsString::new(&allocator, &info.region)?;
+        info!("Client info - region: {}, endpoint: {:?}, port: {}", 
+            info.region, info.endpoint, info.port);
         
-        let access_key_id = AwsString::new(&allocator, &info.credentials.0)?;
-        let secret_access_key = AwsString::new(&allocator, &info.credentials.1)?;
-        let session_token = info.credentials.2.as_ref()
-            .map(|t| AwsString::new(&allocator, t))
-            .transpose()?;
+        let allocator = AwsAllocator::default()
+            .map_err(|e| {
+                error!("Failed to create allocator: {}", e);
+                ServerError::InitializationError(format!("Allocator error: {}", e))
+            })?;
+        
+        let region = AwsString::new(&allocator, &info.region)
+            .map_err(|e| {
+                error!("Failed to create region string: {}", e);
+                ServerError::InitializationError(format!("Region string error: {}", e))
+            })?;
+        
+        // Create credentials object
+        let credentials = AwsCredentials::new(
+            &allocator,
+            &info.credentials.0,
+            &info.credentials.1,
+            info.credentials.2.as_deref(),
+        ).map_err(|e| {
+            error!("Failed to create credentials: {}", e);
+            ServerError::InitializationError(format!("Credentials error: {}", e))
+        })?;
+        
+        info!("Creating vsock config for KMS proxy");
+        
+        // Create hostname if endpoint is specified
+        let host_name = info.endpoint.as_ref()
+            .map(|e| AwsString::new(&allocator, e))
+            .transpose()
+            .map_err(|e| {
+                error!("Failed to create hostname string: {}", e);
+                ServerError::InitializationError(format!("Hostname error: {}", e))
+            })?;
         
         // In enclave, we must use vsock proxy to reach KMS
         // Parent instance is always CID 3, proxy port is typically 8000
-        let proxy_endpoint = Some("3");  // CID 3 for parent instance
-        let proxy_port = 8000;  // Standard vsock-proxy port
-        
-        let config = KmsClientConfig::default(
+        let config = KmsClientConfig::vsock_manual(
+            &allocator,
             &region,
-            &access_key_id,
-            &secret_access_key,
-            session_token.as_ref(),
-            proxy_endpoint,
-            proxy_port,
-        )?;
+            &credentials,
+            "3",  // CID 3 for parent instance
+            8000, // Standard vsock-proxy port
+            host_name.as_ref(),
+        ).map_err(|e| {
+            error!("Failed to create KMS client config: {}", e);
+            ServerError::InitializationError(format!("Config error: {}", e))
+        })?;
+        
+        info!("Creating KMS client from config");
         
         KmsClient::new(config)
-            .map_err(|e| ServerError::InitializationError(e.to_string()))
+            .map_err(|e| {
+                error!("Failed to create KMS client: {}", e);
+                ServerError::InitializationError(format!("Client creation error: {}", e))
+            })
     }
     
     fn decrypt(&self, params: &HashMap<String, serde_json::Value>) -> Result<String> {
+        info!("Decrypt called with params: {:?}", params);
+        
         let ciphertext_b64 = params.get("ciphertext")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ServerError::MissingField("ciphertext".into()))?;
             
+        info!("Decoding base64 ciphertext");
         use base64::Engine as _;
         let ciphertext_bytes = base64::engine::general_purpose::STANDARD.decode(ciphertext_b64)?;
+        info!("Ciphertext decoded, {} bytes", ciphertext_bytes.len());
         
+        info!("Creating allocator for decrypt operation");
         let allocator = AwsAllocator::default()?;
+        
+        info!("Creating KMS client for decrypt");
         let client = self.create_kms_client()?;
         
+        info!("Creating byte buffers");
         let ciphertext_buf = AwsByteBuffer::from_slice(&allocator, &ciphertext_bytes)?;
         let mut plaintext_buf = AwsByteBuffer::new(&allocator, 4096)?;
         
         // Check if we have encryption context
         if let Some(context_value) = params.get("encryption_context") {
             if let Some(context_str) = context_value.as_str() {
+                info!("Decrypting with encryption context");
                 let context = AwsString::new(&allocator, context_str)?;
                 client.decrypt_with_context(None, None, &ciphertext_buf, &context, &mut plaintext_buf)?;
             } else {
+                info!("Decrypting without encryption context (context not a string)");
                 client.decrypt(None, None, &ciphertext_buf, &mut plaintext_buf)?;
             }
         } else {
-            client.decrypt(None, None, &ciphertext_buf, &mut plaintext_buf)?;
+            info!("Decrypting without encryption context");
+            client.decrypt(None, None, &ciphertext_buf, &mut plaintext_buf)
+                .map_err(|e| {
+                    error!("Decrypt failed: {}", e);
+                    e
+                })?;
         }
         
         Ok(base64::engine::general_purpose::STANDARD.encode(plaintext_buf.as_slice()))
