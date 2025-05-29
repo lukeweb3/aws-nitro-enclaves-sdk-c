@@ -158,9 +158,9 @@ COPY --from=builder /tmp/crt-builder/aws-nitro-enclaves-sdk-c/rust-nitro-enclave
 # Development stage with all tools
 FROM $BASE_IMAGE as development
 
+# Only copy the shared libraries that actually exist
 COPY --from=builder /usr/lib64/libnsm.so /usr/lib64/libnsm.so
-COPY --from=builder /usr/lib64/libaws*.so /usr/lib64/
-COPY --from=builder /usr/lib64/libs2n.so /usr/lib64/
+# Copy the statically linked binaries
 COPY --from=builder /tmp/crt-builder/aws-nitro-enclaves-sdk-c/rust-nitro-enclaves-kms-tools/target/release/kmstool_* /usr/bin/
 
 # Install runtime dependencies
