@@ -22,6 +22,7 @@ enum ServerError {
     #[error("Client not set")]
     ClientNotSet,
     #[error("Invalid operation")]
+    #[allow(dead_code)]
     InvalidOperation,
     #[error("Initialization error: {0}")]
     InitializationError(String),
@@ -50,6 +51,7 @@ struct ClientInfo {
     region: String,
     endpoint: Option<String>,
     port: u16,
+    #[allow(dead_code)]
     ca_bundle: Option<String>,
     credentials: (String, String, Option<String>),
 }
@@ -161,7 +163,6 @@ impl Server {
             client.decrypt(None, None, &ciphertext_buf, &mut plaintext_buf)?;
         }
         
-        use base64::Engine as _;
         Ok(base64::engine::general_purpose::STANDARD.encode(plaintext_buf.as_slice()))
     }
     

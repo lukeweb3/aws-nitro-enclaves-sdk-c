@@ -7,6 +7,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use thiserror::Error;
 use tracing::{error, info};
+use aws_credential_types::provider::ProvideCredentials;
 
 #[derive(Error, Debug)]
 enum ClientError {
