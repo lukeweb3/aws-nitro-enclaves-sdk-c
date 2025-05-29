@@ -26,12 +26,17 @@ RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-too
 WORKDIR /tmp/crt-builder
 
 RUN git clone --depth 1 -b v1.12.0 https://github.com/awslabs/aws-lc.git aws-lc
-RUN cmake3 -DCMAKE_PREFIX_PATH=/usr -DCMAKE_INSTALL_PREFIX=/usr -GNinja -DBUILD_TESTING=0 -S aws-lc -B aws-lc/build .
+RUN cmake3 -DCMAKE_PREFIX_PATH=/usr -DCMAKE_INSTALL_PREFIX=/usr -GNinja \
+    -DBUILD_TESTING=0 -DBUILD_SHARED_LIBS=OFF \
+    -S aws-lc -B aws-lc/build .
 RUN go env -w GOPROXY=direct
 RUN cmake3 --build aws-lc/build --parallel $(nproc) --target install
+# List installed libraries for debugging
+RUN ls -la /usr/lib64/lib*.a | grep -E "(crypto|ssl|aws-lc)" || true
 
 RUN git clone --depth 1 -b v1.3.46 https://github.com/aws/s2n-tls.git
-RUN cmake3 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr -S s2n-tls -B s2n-tls/build
+RUN cmake3 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr \
+    -DBUILD_SHARED_LIBS=OFF -S s2n-tls -B s2n-tls/build
 RUN cmake3 --build s2n-tls/build --parallel $(nproc) --target install
 
 RUN git clone --depth 1 -b v0.8.0 https://github.com/awslabs/aws-c-common.git
@@ -74,8 +79,11 @@ RUN mv aws-nitro-enclaves-nsm-api/target/release/nsm.h /usr/include
 # Build the C SDK library for Rust FFI
 COPY . aws-nitro-enclaves-sdk-c
 RUN cmake3 -DCMAKE_PREFIX_PATH=/usr -DCMAKE_INSTALL_PREFIX=/usr -GNinja \
+	-DBUILD_SHARED_LIBS=OFF \
 	-S aws-nitro-enclaves-sdk-c -B aws-nitro-enclaves-sdk-c/build
 RUN cmake3 --build aws-nitro-enclaves-sdk-c/build --parallel $(nproc) --target install
+# List all static libraries for debugging
+RUN echo "=== Installed static libraries ===" && ls -la /usr/lib64/*.a | head -20
 
 # Build Rust tools
 WORKDIR /tmp/crt-builder/aws-nitro-enclaves-sdk-c/rust-nitro-enclaves-kms-tools
@@ -85,6 +93,10 @@ RUN source $HOME/.cargo/env && cargo install bindgen-cli
 
 # Add pkg-config path for finding libraries
 ENV PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/lib/pkgconfig
+
+# Set library path for runtime linking
+ENV LD_LIBRARY_PATH=/usr/lib64:/usr/lib:$LD_LIBRARY_PATH
+ENV LIBRARY_PATH=/usr/lib64:/usr/lib:$LIBRARY_PATH
 
 # Build the Rust tools
 RUN source $HOME/.cargo/env && \

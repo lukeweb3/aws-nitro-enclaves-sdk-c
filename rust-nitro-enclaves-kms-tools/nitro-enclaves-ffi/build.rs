@@ -9,17 +9,19 @@ fn main() {
     println!("cargo:rustc-link-search=native=/usr/lib");
     
     // Link AWS Nitro Enclaves libraries (order matters!)
-    // The order is important: libraries that depend on others must come first
+    // For static libraries, dependencies must come AFTER the libraries that use them
     println!("cargo:rustc-link-lib=static=aws-nitro-enclaves-sdk-c");
     println!("cargo:rustc-link-lib=static=aws-c-auth");
     println!("cargo:rustc-link-lib=static=aws-c-http");
     println!("cargo:rustc-link-lib=static=aws-c-compression");
-    println!("cargo:rustc-link-lib=static=aws-c-cal");
     println!("cargo:rustc-link-lib=static=aws-c-io");
+    println!("cargo:rustc-link-lib=static=aws-c-cal");
     println!("cargo:rustc-link-lib=static=s2n");
     println!("cargo:rustc-link-lib=static=aws-c-sdkutils");
     println!("cargo:rustc-link-lib=static=aws-c-common");
-    println!("cargo:rustc-link-lib=static=aws-lc");
+    // AWS-LC is provided as libcrypto and libssl, not as libaws-lc
+    println!("cargo:rustc-link-lib=static=crypto");
+    println!("cargo:rustc-link-lib=static=ssl");
     println!("cargo:rustc-link-lib=static=json-c");
     println!("cargo:rustc-link-lib=nsm");
     
