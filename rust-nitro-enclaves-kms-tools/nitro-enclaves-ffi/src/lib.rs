@@ -225,7 +225,7 @@ impl KmsClient {
                 let error_code = aws_last_error();
                 eprintln!("KmsClient::new - AWS last error code: {}", error_code);
                 if error_code != 0 {
-                    let error_str = aws_error_debug_str(error_code, ptr::null_mut());
+                    let error_str = aws_error_debug_str(error_code);
                     if !error_str.is_null() {
                         let c_str = std::ffi::CStr::from_ptr(error_str);
                         eprintln!("KmsClient::new - AWS error: {:?}", c_str);
@@ -266,7 +266,7 @@ impl KmsClient {
                 let error_code = aws_last_error();
                 eprintln!("KmsClient::decrypt - AWS last error code: {}", error_code);
                 if error_code != 0 {
-                    let error_str = aws_error_debug_str(error_code, ptr::null_mut());
+                    let error_str = aws_error_debug_str(error_code);
                     if !error_str.is_null() {
                         let c_str = std::ffi::CStr::from_ptr(error_str);
                         eprintln!("KmsClient::decrypt - AWS error: {:?}", c_str);
@@ -403,7 +403,13 @@ impl KmsClientConfig {
                 return Err(NitroEnclavesError::NullPointer);
             }
             
-            Ok(Self { config })
+            Ok(Self { 
+                config,
+                _region: None,
+                _access_key: None,
+                _secret_key: None,
+                _session_token: None,
+            })
         }
     }
     
@@ -432,7 +438,7 @@ impl KmsClientConfig {
             socket_endpoint.port = port;
             
             eprintln!("KmsClientConfig::vsock - Socket endpoint: address={:?}, port={}", 
-                std::str::from_utf8(&socket_endpoint.address[..copy_len-1]).unwrap_or("invalid"), 
+                std::str::from_utf8(unsafe { std::slice::from_raw_parts(socket_endpoint.address.as_ptr() as *const u8, copy_len-1) }).unwrap_or("invalid"), 
                 socket_endpoint.port);
             
             // Use domain value 3 for AWS_SOCKET_VSOCK
@@ -518,7 +524,7 @@ impl KmsClientConfig {
             (*config).region = region.as_ptr();
             (*config).endpoint = endpoint_ptr;
             (*config).domain = 3; // AWS_SOCKET_VSOCK
-            (*config).credentials = credentials.as_ptr();
+            (*config).credentials = credentials.as_ptr() as *mut _;
             (*config).host_name = host_name.map(|h| h.as_ptr()).unwrap_or(ptr::null());
             
             eprintln!("KmsClientConfig::vsock_manual - Config created successfully");
