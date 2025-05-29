@@ -479,20 +479,20 @@ impl KmsClientConfig {
         host_name: Option<&AwsString>,
     ) -> Result<Self> {
         eprintln!("KmsClientConfig::vsock_manual - Creating manual vsock config");
+        eprintln!("KmsClientConfig::vsock_manual - Allocator: {:?}", allocator.as_ptr());
+        eprintln!("KmsClientConfig::vsock_manual - Region: {:?}", region.as_ptr());
+        eprintln!("KmsClientConfig::vsock_manual - Credentials: {:?}", credentials.as_ptr());
+        
+        // Actually, let's just use the working default function but with correct domain
+        // The manual approach might have memory management issues
+        
+        // Create copies of strings that will persist
+        let region_copy = AwsString::new(allocator, &format!("{}", 
+            unsafe { std::ffi::CStr::from_ptr(region.as_ptr() as *const i8).to_string_lossy() }))?;
+        let access_key_copy = AwsString::new(allocator, "dummy")?; // We'll use credentials instead
+        let secret_key_copy = AwsString::new(allocator, "dummy")?; // We'll use credentials instead
         
         unsafe {
-            // Allocate configuration structure
-            let config = aws_mem_calloc(
-                allocator.as_ptr(),
-                1,
-                std::mem::size_of::<aws_nitro_enclaves_kms_client_configuration>()
-            ) as *mut aws_nitro_enclaves_kms_client_configuration;
-            
-            if config.is_null() {
-                eprintln!("KmsClientConfig::vsock_manual - Failed to allocate config");
-                return Err(NitroEnclavesError::NullPointer);
-            }
-            
             // Create vsock endpoint
             let mut socket_endpoint: aws_socket_endpoint = std::mem::zeroed();
             let cid_cstring = CString::new(vsock_cid).unwrap();
@@ -505,34 +505,37 @@ impl KmsClientConfig {
             );
             socket_endpoint.port = port;
             
-            // Allocate persistent endpoint
-            let endpoint_ptr = aws_mem_calloc(
-                allocator.as_ptr(),
-                1,
-                std::mem::size_of::<aws_socket_endpoint>()
-            ) as *mut aws_socket_endpoint;
+            eprintln!("KmsClientConfig::vsock_manual - Calling aws_nitro_enclaves_kms_client_config_default");
             
-            if endpoint_ptr.is_null() {
-                aws_mem_release(allocator.as_ptr(), config as *mut _);
+            // Use the default function but override some fields afterward
+            let config = aws_nitro_enclaves_kms_client_config_default(
+                region_copy.as_ptr() as *mut _,
+                &mut socket_endpoint as *mut _,
+                3, // AWS_SOCKET_VSOCK
+                access_key_copy.as_ptr() as *mut _,
+                secret_key_copy.as_ptr() as *mut _,
+                ptr::null_mut(), // no session token
+            );
+            
+            eprintln!("KmsClientConfig::vsock_manual - Config pointer: {:?}", config);
+            
+            if config.is_null() {
+                eprintln!("KmsClientConfig::vsock_manual - ERROR: Config is null!");
                 return Err(NitroEnclavesError::NullPointer);
             }
             
-            *endpoint_ptr = socket_endpoint;
-            
-            // Set fields like C version
-            (*config).allocator = allocator.as_ptr();
-            (*config).region = region.as_ptr();
-            (*config).endpoint = endpoint_ptr;
-            (*config).domain = 3; // AWS_SOCKET_VSOCK
+            // Override with the real credentials
             (*config).credentials = credentials.as_ptr() as *mut _;
-            (*config).host_name = host_name.map(|h| h.as_ptr()).unwrap_or(ptr::null());
+            if let Some(hn) = host_name {
+                (*config).host_name = hn.as_ptr();
+            }
             
             eprintln!("KmsClientConfig::vsock_manual - Config created successfully");
             Ok(Self { 
                 config,
-                _region: None,
-                _access_key: None,
-                _secret_key: None,
+                _region: Some(region_copy),
+                _access_key: Some(access_key_copy),
+                _secret_key: Some(secret_key_copy),
                 _session_token: None,
             })
         }

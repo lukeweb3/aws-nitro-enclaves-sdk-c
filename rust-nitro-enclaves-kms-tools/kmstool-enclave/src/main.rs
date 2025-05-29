@@ -132,37 +132,37 @@ impl Server {
                 ServerError::InitializationError(format!("Region string error: {}", e))
             })?;
         
-        // Create credentials object
-        let credentials = AwsCredentials::new(
-            &allocator,
-            &info.credentials.0,
-            &info.credentials.1,
-            info.credentials.2.as_deref(),
-        ).map_err(|e| {
-            error!("Failed to create credentials: {}", e);
-            ServerError::InitializationError(format!("Credentials error: {}", e))
-        })?;
+        let access_key_id = AwsString::new(&allocator, &info.credentials.0)
+            .map_err(|e| {
+                error!("Failed to create access_key_id string: {}", e);
+                ServerError::InitializationError(format!("Access key string error: {}", e))
+            })?;
+            
+        let secret_access_key = AwsString::new(&allocator, &info.credentials.1)
+            .map_err(|e| {
+                error!("Failed to create secret_access_key string: {}", e);
+                ServerError::InitializationError(format!("Secret key string error: {}", e))
+            })?;
+            
+        let session_token = info.credentials.2.as_ref()
+            .map(|t| AwsString::new(&allocator, t))
+            .transpose()
+            .map_err(|e| {
+                error!("Failed to create session_token string: {}", e);
+                ServerError::InitializationError(format!("Session token string error: {}", e))
+            })?;
         
         info!("Creating vsock config for KMS proxy");
         
-        // Create hostname if endpoint is specified
-        let host_name = info.endpoint.as_ref()
-            .map(|e| AwsString::new(&allocator, e))
-            .transpose()
-            .map_err(|e| {
-                error!("Failed to create hostname string: {}", e);
-                ServerError::InitializationError(format!("Hostname error: {}", e))
-            })?;
-        
         // In enclave, we must use vsock proxy to reach KMS
         // Parent instance is always CID 3, proxy port is typically 8000
-        let config = KmsClientConfig::vsock_manual(
-            &allocator,
+        let config = KmsClientConfig::vsock(
             &region,
-            &credentials,
+            &access_key_id,
+            &secret_access_key,
+            session_token.as_ref(),
             "3",  // CID 3 for parent instance
             8000, // Standard vsock-proxy port
-            host_name.as_ref(),
         ).map_err(|e| {
             error!("Failed to create KMS client config: {}", e);
             ServerError::InitializationError(format!("Config error: {}", e))
