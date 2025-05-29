@@ -152,15 +152,25 @@ impl Server {
                 ServerError::InitializationError(format!("Session token string error: {}", e))
             })?;
         
-        info!("Creating vsock config for KMS proxy");
+        info!("Creating credentials and vsock config for KMS proxy");
+        
+        // Create AWS credentials from the provided access keys
+        let credentials = AwsCredentials::new(
+            &allocator,
+            &info.credentials.0,
+            &info.credentials.1,
+            info.credentials.2.as_ref().map(String::as_str),
+        ).map_err(|e| {
+            error!("Failed to create credentials: {}", e);
+            ServerError::InitializationError(format!("Credentials error: {}", e))
+        })?;
         
         // In enclave, we must use vsock proxy to reach KMS
         // Parent instance is always CID 3, proxy port is typically 8000
         let config = KmsClientConfig::vsock(
+            &allocator,
             &region,
-            &access_key_id,
-            &secret_access_key,
-            session_token.as_ref(),
+            &credentials,
             "3",  // CID 3 for parent instance
             8000, // Standard vsock-proxy port
         ).map_err(|e| {
@@ -298,10 +308,14 @@ async fn main() -> Result<()> {
     
     info!("Starting kmstool-enclave server");
     
-    // Initialize AWS SDK
+    // Initialize AWS SDK first with NULL (default) allocator
+    info!("Initializing AWS Nitro Enclaves library...");
+    init_with_null();
+    
+    // Now get the allocator after initialization
+    info!("Getting allocator after library initialization...");
     let allocator = AwsAllocator::default()
         .map_err(|e| ServerError::InitializationError(e.to_string()))?;
-    init(&allocator);
     
     // Seed entropy
     if let Err(e) = seed_entropy(256) {

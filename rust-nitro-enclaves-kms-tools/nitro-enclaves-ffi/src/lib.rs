@@ -30,18 +30,24 @@ pub struct AwsAllocator {
 impl AwsAllocator {
     pub fn default() -> Result<Self> {
         unsafe {
-            // Try to get the default allocator from aws-c-common
+            eprintln!("AwsAllocator::default - Attempting to get nitro enclaves allocator...");
+            // Use nitro enclaves allocator first like C version does
+            let allocator = aws_nitro_enclaves_get_allocator();
+            if !allocator.is_null() {
+                eprintln!("AwsAllocator::default - Successfully using nitro enclaves allocator: {:?}", allocator);
+                return Ok(Self { allocator });
+            }
+            
+            eprintln!("AwsAllocator::default - Nitro enclaves allocator is null, trying default allocator...");
+            // Fall back to default allocator if nitro enclaves allocator not available
             let allocator = aws_default_allocator();
             if allocator.is_null() {
-                // Fall back to nitro enclaves allocator if available
-                let allocator = aws_nitro_enclaves_get_allocator();
-                if allocator.is_null() {
-                    return Err(NitroEnclavesError::NullPointer);
-                }
-                Ok(Self { allocator })
-            } else {
-                Ok(Self { allocator })
+                eprintln!("AwsAllocator::default - ERROR: Both allocators are null! Library may not be initialized.");
+                return Err(NitroEnclavesError::NullPointer);
             }
+            
+            eprintln!("AwsAllocator::default - Using default allocator: {:?}", allocator);
+            Ok(Self { allocator })
         }
     }
     
@@ -214,10 +220,58 @@ pub struct KmsClient {
 impl KmsClient {
     pub fn new(config: KmsClientConfig) -> Result<Self> {
         eprintln!("KmsClient::new - Creating KMS client");
+        eprintln!("KmsClient::new - Config pointer: {:?}", config.config);
         
         unsafe {
+            // Debug: Print config fields in detail
+            if !config.config.is_null() {
+                eprintln!("KmsClient::new - Detailed config inspection:");
+                eprintln!("  config.allocator: {:?}", (*config.config).allocator);
+                eprintln!("  config.region: {:?}", (*config.config).region);
+                eprintln!("  config.endpoint: {:?}", (*config.config).endpoint);
+                eprintln!("  config.domain: {}", (*config.config).domain);
+                eprintln!("  config.credentials: {:?}", (*config.config).credentials);
+                eprintln!("  config.credentials_provider: {:?}", (*config.config).credentials_provider);
+                eprintln!("  config.host_name: {:?}", (*config.config).host_name);
+                
+                // Validate region string content
+                if !(*config.config).region.is_null() {
+                    eprintln!("KmsClient::new - Region string is valid, checking content...");
+                    // Try to read region string length or content safely
+                } else {
+                    eprintln!("KmsClient::new - ERROR: Region string is null!");
+                }
+                
+                // Validate credentials content
+                if !(*config.config).credentials.is_null() {
+                    eprintln!("KmsClient::new - Credentials object is valid");
+                } else {
+                    eprintln!("KmsClient::new - ERROR: Credentials object is null!");
+                }
+                
+                // Validate endpoint content
+                if !(*config.config).endpoint.is_null() {
+                    let endpoint = (*config.config).endpoint;
+                    eprintln!("KmsClient::new - Endpoint details:");
+                    eprintln!("    address: {:?}", 
+                        std::str::from_utf8(std::slice::from_raw_parts((*endpoint).address.as_ptr() as *const u8, 2)).unwrap_or("invalid"));
+                    eprintln!("    port: {}", (*endpoint).port);
+                } else {
+                    eprintln!("KmsClient::new - ERROR: Endpoint is null!");
+                }
+                
+                // Validate allocator
+                if (*config.config).allocator.is_null() {
+                    eprintln!("KmsClient::new - WARNING: Allocator is null (will use default)");
+                }
+            } else {
+                eprintln!("KmsClient::new - ERROR: Config is null!");
+                return Err(NitroEnclavesError::NullPointer);
+            }
+            
+            eprintln!("KmsClient::new - About to call aws_nitro_enclaves_kms_client_new...");
             let client = aws_nitro_enclaves_kms_client_new(config.config);
-            eprintln!("KmsClient::new - Client pointer: {:?}", client);
+            eprintln!("KmsClient::new - aws_nitro_enclaves_kms_client_new returned: {:?}", client);
             
             if client.is_null() {
                 eprintln!("KmsClient::new - ERROR: Client is null!");
@@ -229,12 +283,16 @@ impl KmsClient {
                     if !error_str.is_null() {
                         let c_str = std::ffi::CStr::from_ptr(error_str);
                         eprintln!("KmsClient::new - AWS error: {:?}", c_str);
+                    } else {
+                        eprintln!("KmsClient::new - AWS error string is null");
                     }
+                } else {
+                    eprintln!("KmsClient::new - No AWS error code set");
                 }
                 return Err(NitroEnclavesError::NullPointer);
             }
             
-            eprintln!("KmsClient::new - Client created successfully");
+            eprintln!("KmsClient::new - Client created successfully at: {:?}", client);
             Ok(Self { client })
         }
     }
@@ -362,6 +420,9 @@ pub struct KmsClientConfig {
     _access_key: Option<AwsString>,
     _secret_key: Option<AwsString>,
     _session_token: Option<AwsString>,
+    // Track if we manually allocated memory
+    manually_allocated: bool,
+    allocator: Option<*mut aws_allocator>,
 }
 
 impl KmsClientConfig {
@@ -409,62 +470,120 @@ impl KmsClientConfig {
                 _access_key: None,
                 _secret_key: None,
                 _session_token: None,
+                manually_allocated: false,
+                allocator: None,
             })
         }
     }
     
+    // Create configuration like C version does - use stack allocation like C
     pub fn vsock(
+        allocator: &AwsAllocator,
         region: &AwsString,
-        access_key_id: &AwsString,
-        secret_access_key: &AwsString,
-        session_token: Option<&AwsString>,
+        credentials: &AwsCredentials,
         vsock_cid: &str,
         port: u16,
     ) -> Result<Self> {
-        eprintln!("KmsClientConfig::vsock - Creating vsock config with CID: {}, port: {}", vsock_cid, port);
+        eprintln!("KmsClientConfig::vsock - Creating stack-based vsock config with CID: {}, port: {}", vsock_cid, port);
+        eprintln!("KmsClientConfig::vsock - Input allocator: {:?}", allocator.as_ptr());
+        eprintln!("KmsClientConfig::vsock - Input region: {:?}", region.as_ptr());
+        eprintln!("KmsClientConfig::vsock - Input credentials: {:?}", credentials.as_ptr());
         
         unsafe {
-            // Create vsock endpoint
-            let mut socket_endpoint: aws_socket_endpoint = std::mem::zeroed();
+            // Create endpoint on stack like C version
+            let mut endpoint: aws_socket_endpoint = std::mem::zeroed();
             let cid_cstring = CString::new(vsock_cid).unwrap();
             let cid_bytes = cid_cstring.as_bytes_with_nul();
-            // Copy the CID string to the address array
-            let copy_len = cid_bytes.len().min(socket_endpoint.address.len());
+            let copy_len = cid_bytes.len().min(endpoint.address.len());
+            eprintln!("KmsClientConfig::vsock - Copying CID '{}' ({} bytes) to stack endpoint", vsock_cid, copy_len);
             ptr::copy_nonoverlapping(
                 cid_bytes.as_ptr() as *const i8,
-                socket_endpoint.address.as_mut_ptr(),
+                endpoint.address.as_mut_ptr(),
                 copy_len
             );
-            socket_endpoint.port = port;
+            endpoint.port = port;
             
-            eprintln!("KmsClientConfig::vsock - Socket endpoint: address={:?}, port={}", 
-                std::str::from_utf8(unsafe { std::slice::from_raw_parts(socket_endpoint.address.as_ptr() as *const u8, copy_len-1) }).unwrap_or("invalid"), 
-                socket_endpoint.port);
+            eprintln!("KmsClientConfig::vsock - Stack endpoint configured: address={:?}, port={}", 
+                std::str::from_utf8(std::slice::from_raw_parts(endpoint.address.as_ptr() as *const u8, copy_len-1)).unwrap_or("invalid"),
+                endpoint.port);
             
-            // Use domain value 3 for AWS_SOCKET_VSOCK
-            let config = aws_nitro_enclaves_kms_client_config_default(
-                region.as_ptr() as *mut _,
-                &mut socket_endpoint as *mut _,
-                3, // AWS_SOCKET_VSOCK
-                access_key_id.as_ptr() as *mut _,
-                secret_access_key.as_ptr() as *mut _,
-                session_token.map(|s| s.as_ptr() as *mut _).unwrap_or(ptr::null_mut()),
-            );
+            // Allocate persistent endpoint storage
+            let endpoint_ptr = aws_mem_calloc(
+                allocator.as_ptr(),
+                1,
+                std::mem::size_of::<aws_socket_endpoint>()
+            ) as *mut aws_socket_endpoint;
             
-            eprintln!("KmsClientConfig::vsock - Config pointer: {:?}", config);
-            
-            if config.is_null() {
-                eprintln!("KmsClientConfig::vsock - ERROR: Config is null!");
+            if endpoint_ptr.is_null() {
+                eprintln!("KmsClientConfig::vsock - ERROR: Failed to allocate persistent endpoint");
                 return Err(NitroEnclavesError::NullPointer);
             }
             
-            eprintln!("KmsClientConfig::vsock - Config created successfully");
+            // Copy stack endpoint to persistent storage
+            ptr::copy_nonoverlapping(&endpoint, endpoint_ptr, 1);
+            
+            // Create configuration on stack like C version, then copy to heap for persistence
+            let mut config: aws_nitro_enclaves_kms_client_configuration = std::mem::zeroed();
+            config.allocator = allocator.as_ptr();
+            config.region = region.as_ptr();
+            config.endpoint = endpoint_ptr;
+            config.domain = 3; // AWS_SOCKET_VSOCK
+            config.credentials = credentials.as_ptr() as *mut _;
+            config.credentials_provider = ptr::null_mut();
+            config.host_name = ptr::null();
+            
+            eprintln!("KmsClientConfig::vsock - Stack configuration initialized:");
+            eprintln!("  allocator: {:?}", config.allocator);
+            eprintln!("  region: {:?}", config.region);
+            eprintln!("  endpoint: {:?}", config.endpoint);
+            eprintln!("  domain: {}", config.domain);
+            eprintln!("  credentials: {:?}", config.credentials);
+            eprintln!("  credentials_provider: {:?}", config.credentials_provider);
+            eprintln!("  host_name: {:?}", config.host_name);
+            
+            // Allocate persistent config storage
+            let config_ptr = aws_mem_calloc(
+                allocator.as_ptr(),
+                1,
+                std::mem::size_of::<aws_nitro_enclaves_kms_client_configuration>()
+            ) as *mut aws_nitro_enclaves_kms_client_configuration;
+            
+            if config_ptr.is_null() {
+                eprintln!("KmsClientConfig::vsock - ERROR: Failed to allocate persistent config");
+                aws_mem_release(allocator.as_ptr(), endpoint_ptr as *mut _);
+                return Err(NitroEnclavesError::NullPointer);
+            }
+            
+            // Copy stack config to persistent storage
+            ptr::copy_nonoverlapping(&config, config_ptr, 1);
+            
+            eprintln!("KmsClientConfig::vsock - Persistent config created at: {:?}", config_ptr);
+            
+            // Final validation
+            if (*config_ptr).region.is_null() {
+                eprintln!("KmsClientConfig::vsock - ERROR: Region is null in persistent config!");
+                aws_mem_release(allocator.as_ptr(), endpoint_ptr as *mut _);
+                aws_mem_release(allocator.as_ptr(), config_ptr as *mut _);
+                return Err(NitroEnclavesError::NullPointer);
+            }
+            
+            if (*config_ptr).credentials.is_null() {
+                eprintln!("KmsClientConfig::vsock - ERROR: Credentials is null in persistent config!");
+                aws_mem_release(allocator.as_ptr(), endpoint_ptr as *mut _);
+                aws_mem_release(allocator.as_ptr(), config_ptr as *mut _);
+                return Err(NitroEnclavesError::NullPointer);
+            }
+            
+            eprintln!("KmsClientConfig::vsock - Stack-based config created successfully");
+            
             Ok(Self { 
-                config,
+                config: config_ptr,
                 _region: None,
                 _access_key: None,
                 _secret_key: None,
                 _session_token: None,
+                manually_allocated: true,
+                allocator: Some(allocator.as_ptr()),
             })
         }
     }
@@ -537,6 +656,8 @@ impl KmsClientConfig {
                 _access_key: Some(access_key_copy),
                 _secret_key: Some(secret_key_copy),
                 _session_token: None,
+                manually_allocated: false,
+                allocator: None,
             })
         }
     }
@@ -546,7 +667,18 @@ impl Drop for KmsClientConfig {
     fn drop(&mut self) {
         unsafe {
             if !self.config.is_null() {
-                aws_nitro_enclaves_kms_client_config_destroy(self.config);
+                if self.manually_allocated {
+                    if let Some(allocator) = self.allocator {
+                        // Free endpoint if it exists
+                        if !(*self.config).endpoint.is_null() {
+                            aws_mem_release(allocator, (*self.config).endpoint as *mut _);
+                        }
+                        // Free the config struct itself
+                        aws_mem_release(allocator, self.config as *mut _);
+                    }
+                } else {
+                    aws_nitro_enclaves_kms_client_config_destroy(self.config);
+                }
             }
         }
     }
@@ -564,6 +696,13 @@ fn aws_byte_cursor_from_str(s: &str) -> aws_byte_cursor {
 pub fn init(allocator: &AwsAllocator) {
     unsafe {
         aws_nitro_enclaves_library_init(allocator.as_ptr());
+    }
+}
+
+// Library initialization with NULL allocator (like C version does)
+pub fn init_with_null() {
+    unsafe {
+        aws_nitro_enclaves_library_init(ptr::null_mut());
     }
 }
 
