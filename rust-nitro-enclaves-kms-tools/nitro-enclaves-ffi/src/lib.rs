@@ -349,7 +349,7 @@ impl KmsClientConfig {
                     se.address.as_mut_ptr(),
                     copy_len
                 );
-                se.port = port as u32;
+                se.port = port;
                 se
             });
             

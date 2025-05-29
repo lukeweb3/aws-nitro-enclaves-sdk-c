@@ -2,8 +2,8 @@ use clap::{Parser, Subcommand};
 use nitro_enclaves_ffi::*;
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io::{self, Write};
+use base64::Engine;
 use thiserror::Error;
 use tracing::{error, info};
 
@@ -101,30 +101,25 @@ fn create_kms_client() -> Result<KmsClient> {
     let region = AwsString::new(&allocator, &get_kms_region()?)?;
     let (access_key, secret_key, session_token) = get_credentials()?;
     
-    let credentials = AwsCredentials::new(
-        &allocator,
-        &access_key,
-        &secret_key,
-        session_token.as_deref(),
-    )?;
-    
-    let endpoint = get_kms_endpoint()
-        .map(|e| AwsString::new(&allocator, &e))
+    let access_key_id = AwsString::new(&allocator, &access_key)?;
+    let secret_access_key = AwsString::new(&allocator, &secret_key)?;
+    let session_token_str = session_token.as_deref()
+        .map(|s| AwsString::new(&allocator, s))
         .transpose()?;
     
-    let ca_cert = get_ca_bundle()
-        .map(|c| AwsString::new(&allocator, &c))
-        .transpose()?;
+    let endpoint_str = get_kms_endpoint();
+    let port = get_proxy_port()?;
     
     let config = KmsClientConfig::default(
         &region,
-        &credentials,
-        endpoint.as_ref(),
-        get_proxy_port()?,
-        ca_cert.as_ref(),
+        &access_key_id,
+        &secret_access_key,
+        session_token_str.as_ref(),
+        endpoint_str.as_deref(),
+        port,
     )?;
     
-    KmsClient::new(config)
+    Ok(KmsClient::new(config)?)
 }
 
 fn decrypt_command(ciphertext: &str) -> Result<()> {
@@ -134,7 +129,7 @@ fn decrypt_command(ciphertext: &str) -> Result<()> {
     let client = create_kms_client()?;
     
     // Decode base64 ciphertext
-    let ciphertext_bytes = base64::decode(ciphertext)?;
+    let ciphertext_bytes = base64::engine::general_purpose::STANDARD.decode(ciphertext)?;
     let ciphertext_buf = AwsByteBuffer::from_slice(&allocator, &ciphertext_bytes)?;
     
     // Prepare output buffer
@@ -170,8 +165,8 @@ fn genkey_command(cmk: &str, key_spec: &str) -> Result<()> {
     
     // Output as JSON
     let result = serde_json::json!({
-        "plaintext": base64::encode(plaintext_buf.as_slice()),
-        "ciphertext": base64::encode(ciphertext_buf.as_slice()),
+        "plaintext": base64::engine::general_purpose::STANDARD.encode(plaintext_buf.as_slice()),
+        "ciphertext": base64::engine::general_purpose::STANDARD.encode(ciphertext_buf.as_slice()),
     });
     
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -203,7 +198,9 @@ fn main() -> Result<()> {
         .init();
     
     // Initialize AWS SDK
-    init();
+    let allocator = AwsAllocator::default()
+        .expect("Failed to create allocator");
+    init(&allocator);
     
     // Seed entropy
     if let Err(e) = seed_entropy(256) {
