@@ -3,11 +3,14 @@ set -e
 
 echo "Building Rust Nitro Enclaves KMS Tools Docker images..."
 
-# Build all stages
-docker build -f Dockerfile.al2 --target kmstool-enclave-rust -t kmstool-enclave-rust:latest .
-docker build -f Dockerfile.al2 --target kmstool-instance-rust -t kmstool-instance-rust:latest .
-docker build -f Dockerfile.al2 --target kmstool-enclave-cli-rust -t kmstool-enclave-cli-rust:latest .
-docker build -f Dockerfile.al2 --target development -t nitro-enclaves-rust-dev:latest .
+# Change to parent directory to have access to the full project
+cd ..
+
+# Build all stages (using the parent directory as context)
+docker build -f rust-nitro-enclaves-kms-tools/Dockerfile.al2 --target kmstool-enclave-rust -t kmstool-enclave-rust:latest .
+docker build -f rust-nitro-enclaves-kms-tools/Dockerfile.al2 --target kmstool-instance-rust -t kmstool-instance-rust:latest .
+docker build -f rust-nitro-enclaves-kms-tools/Dockerfile.al2 --target kmstool-enclave-cli-rust -t kmstool-enclave-cli-rust:latest .
+docker build -f rust-nitro-enclaves-kms-tools/Dockerfile.al2 --target development -t nitro-enclaves-rust-dev:latest .
 
 echo "Build complete!"
 echo ""
