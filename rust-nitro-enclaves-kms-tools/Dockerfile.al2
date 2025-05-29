@@ -120,7 +120,8 @@ RUN BINS="\
     done
 
 # Also copy the Rust standard library dependencies
-RUN cp -fL /tmp/crt-builder/aws-nitro-enclaves-sdk-c/rust-nitro-enclaves-kms-tools/target/release/kmstool_enclave /rootfs/usr/bin/
+RUN mkdir -p /rootfs/usr/bin && \
+    cp -fL /tmp/crt-builder/aws-nitro-enclaves-sdk-c/rust-nitro-enclaves-kms-tools/target/release/kmstool_enclave /rootfs/usr/bin/
 
 RUN mkdir -p /rootfs/etc/pki/tls/certs/ \
     && cp -f /etc/pki/tls/certs/* /rootfs/etc/pki/tls/certs/
