@@ -31,9 +31,6 @@ impl AwsAllocator {
     pub fn default() -> Result<Self> {
         unsafe {
             // Try to get the default allocator from aws-c-common
-            extern "C" {
-                fn aws_default_allocator() -> *mut aws_allocator;
-            }
             let allocator = aws_default_allocator();
             if allocator.is_null() {
                 // Fall back to nitro enclaves allocator if available

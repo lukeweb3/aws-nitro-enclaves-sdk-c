@@ -44,6 +44,7 @@ fn main() {
         .allowlist_function("aws_attestation_.*")
         .allowlist_function("aws_auth_library_.*")
         .allowlist_function("aws_credentials_provider_.*")
+        .allowlist_function("aws_default_allocator")
         .allowlist_type("aws_.*")
         .allowlist_var("AWS_.*")
         .generate()

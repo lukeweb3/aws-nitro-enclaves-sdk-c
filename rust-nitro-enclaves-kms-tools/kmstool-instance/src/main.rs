@@ -116,19 +116,8 @@ fn get_aws_credentials() -> Result<(String, String, Option<String>)> {
     }
     
     // Try to get credentials from default provider chain
-    // In Rust version, we'll initialize the auth library and use default provider
-    unsafe {
-        aws_auth_library_init(aws_default_allocator());
-        
-        let provider = aws_credentials_provider_new_chain_default(aws_default_allocator());
-        if provider.is_null() {
-            return Err(ClientError::CredentialsNotFound);
-        }
-        
-        // This is a simplified version - in production you'd want async credential resolution
-        // For now, we'll just fail if env vars aren't set
-        aws_credentials_provider_release(provider);
-    }
+    // For now, we'll just return an error if env vars aren't set
+    // TODO: Implement proper credential provider chain support
     
     Err(ClientError::CredentialsNotFound)
 }

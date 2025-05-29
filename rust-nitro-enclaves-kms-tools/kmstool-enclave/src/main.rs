@@ -3,12 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::io;
-use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 #[derive(Error, Debug)]
 enum ServerError {
@@ -115,30 +114,23 @@ impl Server {
         let allocator = AwsAllocator::default()?;
         let region = AwsString::new(&allocator, &info.region)?;
         
-        let credentials = AwsCredentials::new(
-            &allocator,
-            &info.credentials.0,
-            &info.credentials.1,
-            info.credentials.2.as_deref(),
-        )?;
-        
-        let endpoint = info.endpoint.as_ref()
-            .map(|e| AwsString::new(&allocator, e))
-            .transpose()?;
-            
-        let ca_cert = info.ca_bundle.as_ref()
-            .map(|c| AwsString::new(&allocator, c))
+        let access_key_id = AwsString::new(&allocator, &info.credentials.0)?;
+        let secret_access_key = AwsString::new(&allocator, &info.credentials.1)?;
+        let session_token = info.credentials.2.as_ref()
+            .map(|t| AwsString::new(&allocator, t))
             .transpose()?;
         
         let config = KmsClientConfig::default(
             &region,
-            &credentials,
-            endpoint.as_ref(),
+            &access_key_id,
+            &secret_access_key,
+            session_token.as_ref(),
+            info.endpoint.as_deref(),
             info.port,
-            ca_cert.as_ref(),
         )?;
         
         KmsClient::new(config)
+            .map_err(|e| ServerError::InitializationError(e.to_string()))
     }
     
     fn decrypt(&self, params: &HashMap<String, serde_json::Value>) -> Result<String> {
@@ -231,7 +223,8 @@ fn create_vsock_listener(port: u32) -> io::Result<UnixListener> {
         
         // Convert to UnixListener
         use std::os::unix::io::FromRawFd;
-        Ok(UnixListener::from_raw_fd(fd))
+        let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+        UnixListener::from_std(std_listener)
     }
 }
 
@@ -246,7 +239,9 @@ async fn main() -> Result<()> {
     info!("Starting kmstool-enclave server");
     
     // Initialize AWS SDK
-    init();
+    let allocator = AwsAllocator::default()
+        .map_err(|e| ServerError::InitializationError(e.to_string()))?;
+    init(&allocator);
     
     // Seed entropy
     if let Err(e) = seed_entropy(256) {
