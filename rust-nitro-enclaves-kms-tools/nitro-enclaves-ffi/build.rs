@@ -4,22 +4,28 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
     
-    // Link AWS Nitro Enclaves libraries
-    println!("cargo:rustc-link-lib=aws-nitro-enclaves-sdk-c");
-    println!("cargo:rustc-link-lib=aws-c-auth");
-    println!("cargo:rustc-link-lib=aws-c-cal");
-    println!("cargo:rustc-link-lib=aws-c-common");
-    println!("cargo:rustc-link-lib=aws-c-compression");
-    println!("cargo:rustc-link-lib=aws-c-http");
-    println!("cargo:rustc-link-lib=aws-c-io");
-    println!("cargo:rustc-link-lib=aws-c-sdkutils");
-    println!("cargo:rustc-link-lib=s2n");
-    println!("cargo:rustc-link-lib=json-c");
+    // Set library search paths
+    println!("cargo:rustc-link-search=native=/usr/lib64");
+    println!("cargo:rustc-link-search=native=/usr/lib");
+    
+    // Link AWS Nitro Enclaves libraries (order matters!)
+    println!("cargo:rustc-link-lib=static=aws-nitro-enclaves-sdk-c");
+    println!("cargo:rustc-link-lib=static=aws-c-auth");
+    println!("cargo:rustc-link-lib=static=aws-c-cal");
+    println!("cargo:rustc-link-lib=static=aws-c-http");
+    println!("cargo:rustc-link-lib=static=aws-c-compression");
+    println!("cargo:rustc-link-lib=static=aws-c-io");
+    println!("cargo:rustc-link-lib=static=aws-c-sdkutils");
+    println!("cargo:rustc-link-lib=static=aws-c-common");
+    println!("cargo:rustc-link-lib=static=s2n");
+    println!("cargo:rustc-link-lib=static=aws-lc");
+    println!("cargo:rustc-link-lib=static=json-c");
     println!("cargo:rustc-link-lib=nsm");
     
-    // Link OpenSSL/crypto libraries
-    println!("cargo:rustc-link-lib=ssl");
-    println!("cargo:rustc-link-lib=crypto");
+    // System libraries
+    println!("cargo:rustc-link-lib=pthread");
+    println!("cargo:rustc-link-lib=dl");
+    println!("cargo:rustc-link-lib=m");
     
     // Generate bindings
     let bindings = bindgen::Builder::default()
