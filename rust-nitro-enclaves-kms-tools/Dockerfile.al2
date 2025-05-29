@@ -14,9 +14,12 @@ RUN yum install -y \
 	gcc-c++ \
 	go \
 	ninja-build \
-	doxygen
+	doxygen \
+	clang \
+	clang-devel \
+	llvm-devel
 
-RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain 1.71
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable
 
 # We keep the build artifacts in the -build directory
 WORKDIR /tmp/crt-builder
@@ -78,9 +81,6 @@ WORKDIR /tmp/crt-builder/aws-nitro-enclaves-sdk-c/rust-nitro-enclaves-kms-tools
 
 # Install additional Rust dependencies
 RUN source $HOME/.cargo/env && cargo install bindgen-cli
-
-# Update the build.rs to fix the bindgen issue and path issues
-RUN sed -i 's/bindgen::CargoCallbacks/bindgen::CargoCallbacks::new()/g' nitro-enclaves-ffi/build.rs
 
 # Add pkg-config path for finding libraries
 ENV PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/lib/pkgconfig

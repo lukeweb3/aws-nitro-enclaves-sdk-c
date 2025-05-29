@@ -4,8 +4,7 @@
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
-use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int, c_void};
+use std::ffi::CString;
 use std::ptr;
 use thiserror::Error;
 
@@ -31,11 +30,21 @@ pub struct AwsAllocator {
 impl AwsAllocator {
     pub fn default() -> Result<Self> {
         unsafe {
-            let allocator = aws_nitro_enclaves_get_allocator();
-            if allocator.is_null() {
-                return Err(NitroEnclavesError::NullPointer);
+            // Try to get the default allocator from aws-c-common
+            extern "C" {
+                fn aws_default_allocator() -> *mut aws_allocator;
             }
-            Ok(Self { allocator })
+            let allocator = aws_default_allocator();
+            if allocator.is_null() {
+                // Fall back to nitro enclaves allocator if available
+                let allocator = aws_nitro_enclaves_get_allocator();
+                if allocator.is_null() {
+                    return Err(NitroEnclavesError::NullPointer);
+                }
+                Ok(Self { allocator })
+            } else {
+                Ok(Self { allocator })
+            }
         }
     }
     
@@ -88,14 +97,7 @@ pub struct AwsByteBuffer {
 
 impl AwsByteBuffer {
     pub fn new(allocator: &AwsAllocator, capacity: usize) -> Result<Self> {
-        let mut buffer = aws_byte_buf {
-            allocator: ptr::null_mut(),
-            buffer: ptr::null_mut(),
-            len: 0,
-            capacity: 0,
-            _bitfield_align_1: Default::default(),
-            _bitfield_1: Default::default(),
-        };
+        let mut buffer = unsafe { std::mem::zeroed::<aws_byte_buf>() };
         
         unsafe {
             let result = aws_byte_buf_init(&mut buffer, allocator.as_ptr(), capacity);
@@ -235,7 +237,7 @@ impl KmsClient {
                 self.client,
                 key_id.map(|s| s.as_ptr()).unwrap_or(ptr::null()),
                 encryption_algorithm.map(|s| s.as_ptr()).unwrap_or(ptr::null()),
-                ciphertext.buffer as *const _,
+                &ciphertext.buffer as *const _,
                 plaintext.as_mut_ptr(),
             );
             
@@ -259,7 +261,7 @@ impl KmsClient {
                 self.client,
                 key_id.map(|s| s.as_ptr()).unwrap_or(ptr::null()),
                 encryption_algorithm.map(|s| s.as_ptr()).unwrap_or(ptr::null()),
-                ciphertext.buffer as *const _,
+                &ciphertext.buffer as *const _,
                 encryption_context.as_ptr(),
                 plaintext.as_mut_ptr(),
             );
@@ -328,18 +330,31 @@ pub struct KmsClientConfig {
 impl KmsClientConfig {
     pub fn default(
         region: &AwsString,
-        credentials: &AwsCredentials,
-        endpoint: Option<&AwsString>,
+        access_key_id: &AwsString,
+        secret_access_key: &AwsString,
+        session_token: Option<&AwsString>,
+        endpoint: Option<&str>,
         port: u16,
-        ca_cert: Option<&AwsString>,
     ) -> Result<Self> {
         unsafe {
+            // Create socket endpoint if provided
+            let mut socket_endpoint = endpoint.map(|ep| {
+                let mut se: aws_socket_endpoint = std::mem::zeroed();
+                let ep_cstring = CString::new(ep).unwrap();
+                let ep_bytes = ep_cstring.as_bytes();
+                se.address.len = ep_bytes.len();
+                ptr::copy_nonoverlapping(ep_bytes.as_ptr(), se.address.addr.as_mut_ptr(), ep_bytes.len().min(256));
+                se.port = port;
+                se
+            });
+            
             let config = aws_nitro_enclaves_kms_client_config_default(
-                region.as_ptr(),
-                credentials.as_ptr(),
-                endpoint.map(|s| s.as_ptr()).unwrap_or(ptr::null()),
-                port,
-                ca_cert.map(|s| s.as_ptr()).unwrap_or(ptr::null()),
+                region.as_ptr() as *mut _,
+                socket_endpoint.as_mut().map(|se| se as *mut _).unwrap_or(ptr::null_mut()),
+                0, // AWS_SOCKET_IPV4
+                access_key_id.as_ptr() as *mut _,
+                secret_access_key.as_ptr() as *mut _,
+                session_token.map(|s| s.as_ptr() as *mut _).unwrap_or(ptr::null_mut()),
             );
             
             if config.is_null() {
@@ -370,9 +385,9 @@ fn aws_byte_cursor_from_str(s: &str) -> aws_byte_cursor {
 }
 
 // Library initialization
-pub fn init() {
+pub fn init(allocator: &AwsAllocator) {
     unsafe {
-        aws_nitro_enclaves_library_init(aws_default_allocator());
+        aws_nitro_enclaves_library_init(allocator.as_ptr());
     }
 }
 
