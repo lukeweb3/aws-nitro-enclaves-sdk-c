@@ -17,7 +17,8 @@ RUN yum install -y \
 	doxygen \
 	clang \
 	clang-devel \
-	llvm-devel
+	llvm-devel \
+	openssl-devel
 
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable
 

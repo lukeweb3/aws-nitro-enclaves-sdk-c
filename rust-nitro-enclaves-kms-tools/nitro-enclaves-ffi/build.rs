@@ -17,6 +17,10 @@ fn main() {
     println!("cargo:rustc-link-lib=json-c");
     println!("cargo:rustc-link-lib=nsm");
     
+    // Link OpenSSL/crypto libraries
+    println!("cargo:rustc-link-lib=ssl");
+    println!("cargo:rustc-link-lib=crypto");
+    
     // Generate bindings
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
