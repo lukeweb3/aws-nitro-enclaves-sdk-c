@@ -114,11 +114,70 @@ fn get_aws_credentials() -> Result<(String, String, Option<String>)> {
         return Ok((key_id, secret_key, session_token));
     }
     
-    // Try to get credentials from default provider chain
-    // For now, we'll just return an error if env vars aren't set
-    // TODO: Implement proper credential provider chain support
+    // Try to get credentials from EC2 instance metadata
+    if let Ok(creds) = get_ec2_instance_credentials() {
+        return Ok(creds);
+    }
     
     Err(ClientError::CredentialsNotFound)
+}
+
+fn get_ec2_instance_credentials() -> Result<(String, String, Option<String>)> {
+    use std::time::Duration;
+    
+    // First, get the IAM role name
+    let client = std::process::Command::new("curl")
+        .args(&[
+            "-s",
+            "--connect-timeout", "2",
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+        ])
+        .output()
+        .map_err(|e| ClientError::Io(e))?;
+    
+    if !client.status.success() {
+        return Err(ClientError::CredentialsNotFound);
+    }
+    
+    let role_name = String::from_utf8_lossy(&client.stdout).trim().to_string();
+    if role_name.is_empty() {
+        return Err(ClientError::CredentialsNotFound);
+    }
+    
+    // Then get the credentials for that role
+    let creds_url = format!(
+        "http://169.254.169.254/latest/meta-data/iam/security-credentials/{}",
+        role_name
+    );
+    
+    let client = std::process::Command::new("curl")
+        .args(&["-s", "--connect-timeout", "2", &creds_url])
+        .output()
+        .map_err(|e| ClientError::Io(e))?;
+    
+    if !client.status.success() {
+        return Err(ClientError::CredentialsNotFound);
+    }
+    
+    let creds_json = String::from_utf8_lossy(&client.stdout);
+    
+    // Parse the JSON response
+    let creds: serde_json::Value = serde_json::from_str(&creds_json)
+        .map_err(|_| ClientError::CredentialsNotFound)?;
+    
+    let access_key = creds["AccessKeyId"]
+        .as_str()
+        .ok_or(ClientError::CredentialsNotFound)?
+        .to_string();
+    let secret_key = creds["SecretAccessKey"]
+        .as_str()
+        .ok_or(ClientError::CredentialsNotFound)?
+        .to_string();
+    let token = creds["Token"]
+        .as_str()
+        .map(|s| s.to_string());
+    
+    Ok((access_key, secret_key, token))
 }
 
 fn get_region() -> Result<String> {
@@ -140,13 +199,20 @@ fn read_ciphertext(cli_arg: Option<String>) -> Result<String> {
 
 fn send_request(stream: &mut UnixStream, request: &Request) -> Result<Response> {
     // Send request
-    let request_bytes = serde_json::to_vec(request)?;
+    let request_json = serde_json::to_string(request)?;
+    info!("Sending request: {}", request_json);
+    
+    // Send as newline-terminated JSON
+    let request_bytes = format!("{}\n", request_json).into_bytes();
     stream.write_all(&request_bytes)?;
     stream.flush()?;
     
     // Read response
     let mut response_buffer = vec![0u8; 65536];
     let n = stream.read(&mut response_buffer)?;
+    
+    let response_str = String::from_utf8_lossy(&response_buffer[..n]);
+    info!("Received response: {}", response_str);
     
     let response: Response = serde_json::from_slice(&response_buffer[..n])?;
     
