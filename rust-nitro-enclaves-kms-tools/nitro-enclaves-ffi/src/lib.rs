@@ -341,10 +341,15 @@ impl KmsClientConfig {
             let mut socket_endpoint = endpoint.map(|ep| {
                 let mut se: aws_socket_endpoint = std::mem::zeroed();
                 let ep_cstring = CString::new(ep).unwrap();
-                let ep_bytes = ep_cstring.as_bytes();
-                se.address.len = ep_bytes.len();
-                ptr::copy_nonoverlapping(ep_bytes.as_ptr(), se.address.addr.as_mut_ptr(), ep_bytes.len().min(256));
-                se.port = port;
+                let ep_bytes = ep_cstring.as_bytes_with_nul();
+                // Copy the endpoint string to the address array
+                let copy_len = ep_bytes.len().min(se.address.len());
+                ptr::copy_nonoverlapping(
+                    ep_bytes.as_ptr() as *const i8,
+                    se.address.as_mut_ptr(),
+                    copy_len
+                );
+                se.port = port as u32;
                 se
             });
             
