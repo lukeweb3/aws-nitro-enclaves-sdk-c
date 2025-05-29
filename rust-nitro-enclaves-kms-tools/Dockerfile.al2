@@ -99,6 +99,10 @@ ENV LD_LIBRARY_PATH=/usr/lib64:/usr/lib:$LD_LIBRARY_PATH
 ENV LIBRARY_PATH=/usr/lib64:/usr/lib:$LIBRARY_PATH
 
 # Build the Rust tools
+# Set SSL cert location for AWS SDK
+ENV SSL_CERT_FILE=/etc/pki/tls/certs/ca-bundle.crt
+ENV SSL_CERT_DIR=/etc/pki/tls/certs
+
 RUN source $HOME/.cargo/env && \
     BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include" \
     cargo build --release

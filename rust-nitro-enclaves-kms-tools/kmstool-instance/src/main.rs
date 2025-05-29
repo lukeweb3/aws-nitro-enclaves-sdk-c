@@ -104,81 +104,31 @@ fn create_vsock_stream(cid: u32, port: u32) -> io::Result<UnixStream> {
     }
 }
 
-fn get_aws_credentials() -> Result<(String, String, Option<String>)> {
-    // Try to get credentials from environment variables
-    if let (Ok(key_id), Ok(secret_key)) = (
-        env::var("AWS_ACCESS_KEY_ID"),
-        env::var("AWS_SECRET_ACCESS_KEY"),
-    ) {
-        let session_token = env::var("AWS_SESSION_TOKEN").ok();
-        return Ok((key_id, secret_key, session_token));
-    }
+async fn get_aws_credentials() -> Result<(String, String, Option<String>)> {
+    // Use AWS SDK's default credential chain
+    // This will automatically try:
+    // 1. Environment variables
+    // 2. Web identity token from STS
+    // 3. Credential profiles (~/.aws/credentials)
+    // 4. ECS credentials provider
+    // 5. EC2 Instance Metadata Service
     
-    // Try to get credentials from EC2 instance metadata
-    if let Ok(creds) = get_ec2_instance_credentials() {
-        return Ok(creds);
-    }
+    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let credentials_provider = config.credentials_provider()
+        .ok_or(ClientError::CredentialsNotFound)?;
     
-    Err(ClientError::CredentialsNotFound)
-}
-
-fn get_ec2_instance_credentials() -> Result<(String, String, Option<String>)> {
-    use std::time::Duration;
-    
-    // First, get the IAM role name
-    let client = std::process::Command::new("curl")
-        .args(&[
-            "-s",
-            "--connect-timeout", "2",
-            "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
-        ])
-        .output()
-        .map_err(|e| ClientError::Io(e))?;
-    
-    if !client.status.success() {
-        return Err(ClientError::CredentialsNotFound);
-    }
-    
-    let role_name = String::from_utf8_lossy(&client.stdout).trim().to_string();
-    if role_name.is_empty() {
-        return Err(ClientError::CredentialsNotFound);
-    }
-    
-    // Then get the credentials for that role
-    let creds_url = format!(
-        "http://169.254.169.254/latest/meta-data/iam/security-credentials/{}",
-        role_name
-    );
-    
-    let client = std::process::Command::new("curl")
-        .args(&["-s", "--connect-timeout", "2", &creds_url])
-        .output()
-        .map_err(|e| ClientError::Io(e))?;
-    
-    if !client.status.success() {
-        return Err(ClientError::CredentialsNotFound);
-    }
-    
-    let creds_json = String::from_utf8_lossy(&client.stdout);
-    
-    // Parse the JSON response
-    let creds: serde_json::Value = serde_json::from_str(&creds_json)
+    let credentials = credentials_provider
+        .provide_credentials()
+        .await
         .map_err(|_| ClientError::CredentialsNotFound)?;
     
-    let access_key = creds["AccessKeyId"]
-        .as_str()
-        .ok_or(ClientError::CredentialsNotFound)?
-        .to_string();
-    let secret_key = creds["SecretAccessKey"]
-        .as_str()
-        .ok_or(ClientError::CredentialsNotFound)?
-        .to_string();
-    let token = creds["Token"]
-        .as_str()
-        .map(|s| s.to_string());
-    
-    Ok((access_key, secret_key, token))
+    Ok((
+        credentials.access_key_id().to_string(),
+        credentials.secret_access_key().to_string(),
+        credentials.session_token().map(|s| s.to_string()),
+    ))
 }
+
 
 fn get_region() -> Result<String> {
     env::var("AWS_DEFAULT_REGION")
@@ -198,12 +148,14 @@ fn read_ciphertext(cli_arg: Option<String>) -> Result<String> {
 }
 
 fn send_request(stream: &mut UnixStream, request: &Request) -> Result<Response> {
-    // Send request
-    let request_json = serde_json::to_string(request)?;
-    info!("Sending request: {}", request_json);
+    // Send request as JSON without newline (matching enclave's expectation)
+    println!("sending request...");
+    let request_bytes = serde_json::to_vec(request)?;
     
-    // Send as newline-terminated JSON
-    let request_bytes = format!("{}\n", request_json).into_bytes();
+    // Debug: log the request
+    let request_json = serde_json::to_string_pretty(request)?;
+    println!("Sending request: {}", request_json);
+    
     stream.write_all(&request_bytes)?;
     stream.flush()?;
     
@@ -211,6 +163,11 @@ fn send_request(stream: &mut UnixStream, request: &Request) -> Result<Response> 
     let mut response_buffer = vec![0u8; 65536];
     let n = stream.read(&mut response_buffer)?;
     
+    if n == 0 {
+        return Err(ClientError::ServerError("Connection closed by server".to_string()));
+    }
+    
+    // Debug: log the response
     let response_str = String::from_utf8_lossy(&response_buffer[..n]);
     info!("Received response: {}", response_str);
     
@@ -223,7 +180,8 @@ fn send_request(stream: &mut UnixStream, request: &Request) -> Result<Response> 
     Ok(response)
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_target(false)
@@ -243,7 +201,7 @@ fn main() -> Result<()> {
     let mut stream = create_vsock_stream(cid, cli.port)?;
     
     // Get AWS credentials
-    let (aws_key_id, aws_secret_key, aws_session_token) = get_aws_credentials()?;
+    let (aws_key_id, aws_secret_key, aws_session_token) = get_aws_credentials().await?;
     
     // Get region
     let region = cli.region
