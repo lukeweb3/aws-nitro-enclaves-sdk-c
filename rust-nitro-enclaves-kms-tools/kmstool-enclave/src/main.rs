@@ -124,13 +124,18 @@ impl Server {
             .map(|t| AwsString::new(&allocator, t))
             .transpose()?;
         
+        // In enclave, we must use vsock proxy to reach KMS
+        // Parent instance is always CID 3, proxy port is typically 8000
+        let proxy_endpoint = Some("3");  // CID 3 for parent instance
+        let proxy_port = 8000;  // Standard vsock-proxy port
+        
         let config = KmsClientConfig::default(
             &region,
             &access_key_id,
             &secret_access_key,
             session_token.as_ref(),
-            info.endpoint.as_deref(),
-            info.port,
+            proxy_endpoint,
+            proxy_port,
         )?;
         
         KmsClient::new(config)
