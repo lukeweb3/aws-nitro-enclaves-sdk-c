@@ -1,5 +1,4 @@
 use clap::Parser;
-use nitro_enclaves_ffi::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -239,7 +238,8 @@ fn main() -> Result<()> {
     
     // Output plaintext
     if let Some(plaintext_b64) = response.plaintext {
-        let plaintext = base64::decode(plaintext_b64)
+        use base64::Engine as _;
+        let plaintext = base64::engine::general_purpose::STANDARD.decode(plaintext_b64)
             .map_err(|e| ClientError::ServerError(format!("Invalid base64: {}", e)))?;
         io::stdout().write_all(&plaintext)?;
         io::stdout().flush()?;

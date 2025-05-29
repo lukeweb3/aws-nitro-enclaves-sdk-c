@@ -23,6 +23,8 @@ enum ServerError {
     ClientNotSet,
     #[error("Invalid operation")]
     InvalidOperation,
+    #[error("Initialization error: {0}")]
+    InitializationError(String),
     #[error("Missing required field: {0}")]
     MissingField(String),
 }
@@ -138,7 +140,8 @@ impl Server {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ServerError::MissingField("ciphertext".into()))?;
             
-        let ciphertext_bytes = base64::decode(ciphertext_b64)?;
+        use base64::Engine as _;
+        let ciphertext_bytes = base64::engine::general_purpose::STANDARD.decode(ciphertext_b64)?;
         
         let allocator = AwsAllocator::default()?;
         let client = self.create_kms_client()?;
@@ -158,7 +161,8 @@ impl Server {
             client.decrypt(None, None, &ciphertext_buf, &mut plaintext_buf)?;
         }
         
-        Ok(base64::encode(plaintext_buf.as_slice()))
+        use base64::Engine as _;
+        Ok(base64::engine::general_purpose::STANDARD.encode(plaintext_buf.as_slice()))
     }
     
     async fn handle_request(&self, request: Request) -> Response {
@@ -223,7 +227,7 @@ fn create_vsock_listener(port: u32) -> io::Result<UnixListener> {
         
         // Convert to UnixListener
         use std::os::unix::io::FromRawFd;
-        let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+        let std_listener = std::os::unix::net::UnixListener::from_raw_fd(fd);
         UnixListener::from_std(std_listener)
     }
 }

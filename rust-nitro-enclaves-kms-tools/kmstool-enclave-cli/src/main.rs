@@ -80,6 +80,7 @@ fn get_kms_endpoint() -> Option<String> {
     env::var("KMS_ENDPOINT").ok()
 }
 
+#[allow(dead_code)]
 fn get_ca_bundle() -> Option<String> {
     env::var("AWS_CA_BUNDLE").ok().and_then(|path| {
         fs::read_to_string(&path).ok()
