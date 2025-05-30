@@ -99,12 +99,15 @@ impl Server {
                 (key_id, secret_key, aws_session_token)
             },
             _ => {
-                // If no environment credentials, we need to fail here
-                // In the future, we could try to get credentials from instance metadata
-                // through a vsock proxy, but for now we require explicit credentials
-                error!("No AWS credentials found in environment variables");
-                error!("Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY");
-                return false;
+                // If no environment credentials, try to use placeholder for IAM role
+                info!("No AWS credentials in environment, attempting to use IAM role");
+                info!("Note: This requires KMS proxy to handle authentication");
+                // Use placeholder credentials - actual auth will be done by KMS proxy
+                (
+                    "placeholder-for-iam-role".to_string(),
+                    "placeholder-for-iam-role".to_string(),
+                    None
+                )
             }
         };
         
@@ -181,12 +184,23 @@ impl Server {
     fn create_kms_client(&self) -> Result<KmsClient> {
         info!("Creating KMS client");
         
-        // Try auto-configuration if not already configured
-        if !self.try_auto_configure() {
-            error!("KMS client not configured and auto-configuration failed");
-            return Err(ServerError::ClientNotSet);
+        // Check if already configured
+        {
+            let client_info = self.client_info.lock().unwrap();
+            if client_info.is_some() {
+                info!("Using configuration from SetClient");
+            } else {
+                // Not configured, need to auto-configure
+                drop(client_info); // Release the lock before calling try_auto_configure
+                if !self.try_auto_configure() {
+                    error!("KMS client not configured and auto-configuration failed");
+                    return Err(ServerError::ClientNotSet);
+                }
+                info!("Auto-configuration completed");
+            }
         }
         
+        // Now get the configuration (guaranteed to exist)
         let client_info = self.client_info.lock().unwrap();
         let info = client_info.as_ref().ok_or(ServerError::ClientNotSet)?;
         
@@ -514,6 +528,15 @@ impl Server {
     
     async fn handle_request(&self, request: Request) -> Response {
         match request.operation.as_str() {
+            "CheckClient" => {
+                let client_info = self.client_info.lock().unwrap();
+                let is_configured = client_info.is_some();
+                Response {
+                    error: None,
+                    plaintext: Some(if is_configured { "configured" } else { "not_configured" }.to_string()),
+                    ciphertext: None,
+                }
+            },
             "SetClient" => {
                 match self.set_client(&request.params) {
                     Ok(_) => Response {

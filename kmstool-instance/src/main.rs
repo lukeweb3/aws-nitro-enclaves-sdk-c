@@ -131,16 +131,17 @@ fn create_vsock_stream(cid: u32, port: u32) -> io::Result<UnixStream> {
     }
 }
 
-async fn get_aws_credentials() -> Result<(String, String, Option<String>)> {
-    // Use AWS SDK's default credential chain
-    // This will automatically try:
-    // 1. Environment variables
-    // 2. Web identity token from STS
-    // 3. Credential profiles (~/.aws/credentials)
-    // 4. ECS credentials provider
-    // 5. EC2 Instance Metadata Service
-    
+struct AwsConfig {
+    credentials: (String, String, Option<String>),
+    region: Option<String>,
+    endpoint_url: Option<String>,
+}
+
+async fn get_aws_config() -> Result<AwsConfig> {
+    // Load AWS SDK config once and extract all needed information
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    
+    // Get credentials
     let credentials_provider = config.credentials_provider()
         .ok_or(ClientError::CredentialsNotFound)?;
     
@@ -149,15 +150,36 @@ async fn get_aws_credentials() -> Result<(String, String, Option<String>)> {
         .await
         .map_err(|_| ClientError::CredentialsNotFound)?;
     
-    Ok((
-        credentials.access_key_id().to_string(),
-        credentials.secret_access_key().to_string(),
-        credentials.session_token().map(|s| s.to_string()),
-    ))
+    // Get region
+    let region = config.region().map(|r| r.to_string());
+    
+    // Get endpoint URL if configured
+    let endpoint_url = config.endpoint_url().map(|u| u.to_string());
+    
+    Ok(AwsConfig {
+        credentials: (
+            credentials.access_key_id().to_string(),
+            credentials.secret_access_key().to_string(),
+            credentials.session_token().map(|s| s.to_string()),
+        ),
+        region,
+        endpoint_url,
+    })
 }
 
 
-fn get_region() -> Result<String> {
+async fn get_region_from_config() -> Result<String> {
+    // Try to get region from AWS SDK config (includes environment vars and EC2 metadata)
+    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    
+    if let Some(region) = config.region() {
+        Ok(region.to_string())
+    } else {
+        Err(ClientError::MissingArgument)
+    }
+}
+
+fn get_region_from_env() -> Result<String> {
     env::var("AWS_DEFAULT_REGION")
         .or_else(|_| env::var("AWS_REGION"))
         .map_err(|_| ClientError::MissingArgument)
@@ -256,6 +278,21 @@ fn send_request(stream: &mut UnixStream, request: &Request) -> Result<Response> 
     Ok(response)
 }
 
+fn check_client_configured(stream: &mut UnixStream) -> Result<bool> {
+    let check_request = Request {
+        operation: "CheckClient".to_string(),
+        params: HashMap::new(),
+    };
+    
+    let response = send_request(stream, &check_request)?;
+    
+    if let Some(status) = response.plaintext {
+        Ok(status == "configured")
+    } else {
+        Ok(false)
+    }
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
@@ -289,36 +326,66 @@ async fn run() -> Result<()> {
         })?;
     info!("Successfully connected to enclave");
     
-    // Check if we need to send SetClient based on operation
-    let need_set_client = match cli.operation.as_str() {
-        "decrypt" => true, // Decrypt always needs SetClient for backward compatibility
-        "encrypt" | "generate-data-key" => {
-            // For these operations, only send SetClient if we have explicit config
-            // Otherwise, let the enclave auto-configure
-            cli.region.is_some() || get_region().is_ok() || cli.kms_endpoint.is_some()
-        },
-        _ => true,
-    };
+    // Check if client is already configured in the enclave
+    info!("Checking if client is already configured in enclave");
+    let client_already_configured = check_client_configured(&mut stream)
+        .unwrap_or_else(|e| {
+            info!("Failed to check client status, assuming not configured: {}", e);
+            false
+        });
+    
+    let need_set_client = !client_already_configured;
+    
+    if client_already_configured {
+        info!("Client already configured in enclave, skipping SetClient");
+    } else {
+        info!("Client not configured in enclave, will send SetClient");
+    }
     
     if need_set_client {
-        // Get AWS credentials
-        info!("Fetching AWS credentials");
-        let (aws_key_id, aws_secret_key, aws_session_token) = get_aws_credentials().await
+        // Get AWS configuration from SDK
+        info!("Fetching AWS configuration");
+        let aws_config = get_aws_config().await
             .map_err(|e| {
-                error!("Failed to get AWS credentials: {}", e);
+                error!("Failed to get AWS configuration: {}", e);
                 e
             })?;
+        
+        let (aws_key_id, aws_secret_key, aws_session_token) = aws_config.credentials;
         info!("AWS credentials obtained successfully");
         
-        // Get region
+        // Get region with fallback chain
         info!("Getting AWS region");
-        let region = cli.region
-            .or_else(|| get_region().ok())
-            .ok_or_else(|| {
-                error!("AWS region not specified. Please provide --region or set AWS_DEFAULT_REGION/AWS_REGION environment variable");
-                ClientError::MissingArgument
-            })?;
+        let region = if let Some(r) = cli.region {
+            // Use explicitly provided region
+            info!("Using region from command line");
+            r
+        } else if let Some(r) = aws_config.region {
+            // Use region from AWS SDK config
+            info!("Using region from AWS SDK config");
+            r
+        } else if let Ok(r) = get_region_from_env() {
+            // Fallback to environment variables
+            info!("Using region from environment variables");
+            r
+        } else {
+            error!("AWS region not specified. Please provide --region or configure AWS_DEFAULT_REGION/AWS_REGION");
+            return Err(ClientError::MissingArgument);
+        };
         info!("Using AWS region: {}", region);
+        
+        // Get endpoint with fallback chain
+        let endpoint = if let Some(e) = cli.kms_endpoint {
+            // Use explicitly provided endpoint
+            info!("Using KMS endpoint from command line");
+            Some(e)
+        } else if let Some(e) = aws_config.endpoint_url {
+            // Use endpoint from AWS SDK config
+            info!("Using KMS endpoint from AWS SDK config");
+            Some(e)
+        } else {
+            None
+        };
         
         // Load CA bundle if specified
         let ca_bundle = cli.ca_bundle
@@ -336,7 +403,7 @@ async fn run() -> Result<()> {
             set_client_params.insert("aws_session_token".to_string(), serde_json::Value::String(token));
         }
         
-        if let Some(endpoint) = cli.kms_endpoint {
+        if let Some(endpoint) = endpoint {
             set_client_params.insert("endpoint".to_string(), serde_json::Value::String(endpoint));
         }
         
@@ -353,8 +420,6 @@ async fn run() -> Result<()> {
         
         info!("Setting KMS client configuration");
         send_request(&mut stream, &set_client_request)?;
-    } else {
-        info!("Skipping SetClient, letting enclave auto-configure from environment");
     }
     
     // Perform the requested operation
