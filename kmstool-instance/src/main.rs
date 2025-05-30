@@ -15,7 +15,7 @@ enum ClientError {
     Io(#[from] io::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("Server error: {0}")]
+    #[error("{0}")]
     ServerError(String),
     #[error("Missing required argument")]
     MissingArgument,
@@ -78,6 +78,14 @@ struct Cli {
     /// Key spec for generate-data-key operation (AES_128 or AES_256)
     #[arg(long, default_value = "AES_256")]
     key_spec: String,
+    
+    /// For generate-data-key: only output ciphertext (encrypted key)
+    #[arg(long)]
+    ciphertext_only: bool,
+    
+    /// For generate-data-key: only output plaintext (raw key)
+    #[arg(long)]
+    plaintext_only: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -217,7 +225,31 @@ fn send_request(stream: &mut UnixStream, request: &Request) -> Result<Response> 
     
     if let Some(ref error) = response.error {
         error!("Server returned error: {}", error);
-        return Err(ClientError::ServerError(error.clone()));
+        
+        // Parse and improve error messages for common issues
+        let improved_error = if error.contains("KMS proxy connection failed") {
+            format!("Internal Error: {}\n\nSolution: Start the KMS proxy service on the EC2 instance", error)
+        } else if error.contains("Null pointer error") && error.contains("Client creation") {
+            "Internal Error: KMS connection failed. The KMS proxy service is not accessible.\n\n\
+             Possible causes:\n\
+             1. KMS proxy is not running on the parent instance\n\
+             2. Incorrect vsock configuration\n\
+             3. Network connectivity issues\n\n\
+             To diagnose: Run 'sudo netstat -tlnp | grep 8000' on the parent instance".to_string()
+        } else if error.contains("Missing required field: key_id") {
+            "Error: Missing required parameter --key-id\n\n\
+             Usage: --key-id alias/your-key-name or --key-id arn:aws:kms:...".to_string()
+        } else if error.contains("Invalid key_spec") {
+            "Error: Invalid key specification\n\n\
+             Valid values: AES_128, AES_256".to_string()
+        } else if error.contains("Base64 decode error") {
+            "Error: Invalid input format\n\n\
+             The ciphertext must be valid base64 encoded data".to_string()
+        } else {
+            format!("Server Error: {}", error)
+        };
+        
+        return Err(ClientError::ServerError(improved_error));
     }
     
     info!("Response parsed successfully");
@@ -225,7 +257,14 @@ fn send_request(stream: &mut UnixStream, request: &Request) -> Result<Response> 
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("\n{}\n", e);
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_target(false)
@@ -342,10 +381,21 @@ async fn main() -> Result<()> {
             // Output plaintext
             if let Some(plaintext_b64) = response.plaintext {
                 use base64::Engine as _;
-                let plaintext = base64::engine::general_purpose::STANDARD.decode(plaintext_b64)
+                let plaintext_bytes = base64::engine::general_purpose::STANDARD.decode(plaintext_b64)
                     .map_err(|e| ClientError::ServerError(format!("Invalid base64: {}", e)))?;
-                io::stdout().write_all(&plaintext)?;
-                io::stdout().flush()?;
+                
+                // Try to convert to UTF-8 string, fallback to raw bytes if not valid UTF-8
+                match String::from_utf8(plaintext_bytes.clone()) {
+                    Ok(plaintext_str) => {
+                        // Output as string if valid UTF-8
+                        println!("{}", plaintext_str);
+                    }
+                    Err(_) => {
+                        // Output raw bytes if not valid UTF-8
+                        io::stdout().write_all(&plaintext_bytes)?;
+                        io::stdout().flush()?;
+                    }
+                }
             }
         },
         "encrypt" => {
@@ -422,13 +472,38 @@ async fn main() -> Result<()> {
             
             info!("GenerateDataKey successful");
             
-            // Output as JSON with both plaintext and ciphertext
-            let output = serde_json::json!({
-                "plaintext": response.plaintext,
-                "ciphertext": response.ciphertext,
-            });
-            
-            println!("{}", serde_json::to_string_pretty(&output)?);
+            // Output based on flags
+            if cli.ciphertext_only {
+                // Only output ciphertext (for storage)
+                if let Some(ciphertext) = response.ciphertext {
+                    println!("{}", ciphertext);
+                } else {
+                    error!("Server response missing ciphertext");
+                    return Err(ClientError::ServerError("Response missing ciphertext".to_string()));
+                }
+            } else if cli.plaintext_only {
+                // Only output plaintext (decoded to raw bytes)
+                if let Some(plaintext_b64) = response.plaintext {
+                    use base64::Engine as _;
+                    let plaintext_bytes = base64::engine::general_purpose::STANDARD.decode(plaintext_b64)
+                        .map_err(|e| ClientError::ServerError(format!("Invalid base64: {}", e)))?;
+                    
+                    // Output raw key bytes (for use in encryption)
+                    io::stdout().write_all(&plaintext_bytes)?;
+                    io::stdout().flush()?;
+                } else {
+                    error!("Server response missing plaintext");
+                    return Err(ClientError::ServerError("Response missing plaintext".to_string()));
+                }
+            } else {
+                // Default: output as JSON with both plaintext and ciphertext
+                let output = serde_json::json!({
+                    "plaintext": response.plaintext,
+                    "ciphertext": response.ciphertext,
+                });
+                
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            }
         },
         _ => {
             return Err(ClientError::ServerError(format!("Unknown operation: {}", cli.operation)));

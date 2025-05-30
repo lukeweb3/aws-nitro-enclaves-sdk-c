@@ -240,7 +240,22 @@ impl Server {
         KmsClient::new(config)
             .map_err(|e| {
                 error!("Failed to create KMS client: {}", e);
-                ServerError::InitializationError(format!("Client creation error: {}", e))
+                // Check if it's a connection error to KMS proxy
+                let error_msg = match e {
+                    NitroEnclavesError::NullPointer => {
+                        "KMS proxy connection failed (vsock to CID 3 port 8000). Please ensure:\n\
+                         1. KMS proxy is running on the parent instance (port 8000)\n\
+                         2. Run: sudo netstat -tlnp | grep 8000\n\
+                         3. If not running, start your KMS proxy service"
+                    },
+                    NitroEnclavesError::AwsError(code) if code == 0 => {
+                        "KMS proxy connection failed. Check if KMS proxy is running on port 8000"
+                    },
+                    _ => {
+                        return Err(ServerError::InitializationError(format!("KMS client error: {}", e)))
+                    }
+                };
+                ServerError::InitializationError(error_msg.to_string())
             })
     }
     

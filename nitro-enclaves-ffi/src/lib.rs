@@ -277,9 +277,11 @@ impl KmsClient {
             
             if client.is_null() {
                 eprintln!("KmsClient::new - ERROR: Client is null!");
+                
                 // Try to get AWS error
                 let error_code = aws_last_error();
                 eprintln!("KmsClient::new - AWS last error code: {}", error_code);
+                
                 if error_code != 0 {
                     let error_str = aws_error_debug_str(error_code);
                     if !error_str.is_null() {
@@ -290,6 +292,7 @@ impl KmsClient {
                     }
                 } else {
                     eprintln!("KmsClient::new - No AWS error code set");
+                    eprintln!("KmsClient::new - This usually means vsock connection to KMS proxy failed");
                 }
                 return Err(NitroEnclavesError::NullPointer);
             }
