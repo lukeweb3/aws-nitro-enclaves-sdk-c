@@ -28,6 +28,8 @@ enum ServerError {
     InitializationError(String),
     #[error("Missing required field: {0}")]
     MissingField(String),
+    #[error("Invalid parameter: {0}")]
+    InvalidParameter(String),
 }
 
 type Result<T> = std::result::Result<T, ServerError>;
@@ -134,19 +136,19 @@ impl Server {
                 ServerError::InitializationError(format!("Region string error: {}", e))
             })?;
         
-        let access_key_id = AwsString::new(&allocator, &info.credentials.0)
+        let _access_key_id = AwsString::new(&allocator, &info.credentials.0)
             .map_err(|e| {
                 error!("Failed to create access_key_id string: {}", e);
                 ServerError::InitializationError(format!("Access key string error: {}", e))
             })?;
             
-        let secret_access_key = AwsString::new(&allocator, &info.credentials.1)
+        let _secret_access_key = AwsString::new(&allocator, &info.credentials.1)
             .map_err(|e| {
                 error!("Failed to create secret_access_key string: {}", e);
                 ServerError::InitializationError(format!("Secret key string error: {}", e))
             })?;
             
-        let session_token = info.credentials.2.as_ref()
+        let _session_token = info.credentials.2.as_ref()
             .map(|t| AwsString::new(&allocator, t))
             .transpose()
             .map_err(|e| {
@@ -238,7 +240,10 @@ impl Server {
         
         let key_id = params.get("key_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ServerError::MissingField("key_id".into()))?;
+            .ok_or_else(|| {
+                error!("Missing required field: key_id");
+                ServerError::MissingField("key_id".into())
+            })?;
             
         let key_spec = params.get("key_spec")
             .and_then(|v| v.as_str())
@@ -247,36 +252,70 @@ impl Server {
         info!("Generating data key with key_id: {}, key_spec: {}", key_id, key_spec);
         
         info!("Creating allocator for generate data key operation");
-        let allocator = AwsAllocator::default()?;
-        
-        info!("Creating KMS client for generate data key");
-        let client = self.create_kms_client()?;
-        
-        // Convert key_spec string to enum
-        use nitro_enclaves_ffi::aws_key_spec;
-        let key_spec_enum = match key_spec {
-            "AES_128" => aws_key_spec::AWS_KS_AES_128,
-            "AES_256" => aws_key_spec::AWS_KS_AES_256,
-            _ => return Err(ServerError::InvalidParameter),
-        };
-        
-        info!("Creating AWS string for key_id");
-        let key_id_str = AwsString::new(&allocator, key_id)?;
-        
-        info!("Creating byte buffers for output");
-        let mut plaintext_buf = AwsByteBuffer::new(&allocator, 4096)?;
-        let mut ciphertext_buf = AwsByteBuffer::new(&allocator, 4096)?;
-        
-        info!("Calling generate_data_key");
-        client.generate_data_key(&key_id_str, key_spec_enum, &mut plaintext_buf, &mut ciphertext_buf)
+        let allocator = AwsAllocator::default()
             .map_err(|e| {
-                error!("GenerateDataKey failed: {}", e);
+                error!("Failed to create allocator: {:?}", e);
                 e
             })?;
+        
+        info!("Creating KMS client for generate data key");
+        let client = self.create_kms_client()
+            .map_err(|e| {
+                error!("Failed to create KMS client: {:?}", e);
+                e
+            })?;
+        
+        // Convert key_spec string to enum
+        let key_spec_enum = match key_spec {
+            "AES_128" => {
+                info!("Using AES_128 key spec (value: 1)");
+                1 // AWS_KS_AES_128
+            },
+            "AES_256" => {
+                info!("Using AES_256 key spec (value: 0)");
+                0 // AWS_KS_AES_256
+            },
+            _ => {
+                error!("Invalid key_spec provided: {}", key_spec);
+                return Err(ServerError::InvalidParameter(format!("Invalid key_spec: {}. Must be AES_128 or AES_256", key_spec)))
+            },
+        };
+        
+        info!("Creating AWS string for key_id: {}", key_id);
+        let key_id_str = AwsString::new(&allocator, key_id)
+            .map_err(|e| {
+                error!("Failed to create AWS string for key_id: {:?}", e);
+                e
+            })?;
+        
+        info!("Creating byte buffers for output");
+        let mut plaintext_buf = AwsByteBuffer::new(&allocator, 4096)
+            .map_err(|e| {
+                error!("Failed to create plaintext buffer: {:?}", e);
+                e
+            })?;
+        let mut ciphertext_buf = AwsByteBuffer::new(&allocator, 4096)
+            .map_err(|e| {
+                error!("Failed to create ciphertext buffer: {:?}", e);
+                e
+            })?;
+        
+        info!("Calling KMS generate_data_key with key_spec_enum: {}", key_spec_enum);
+        client.generate_data_key(&key_id_str, key_spec_enum, &mut plaintext_buf, &mut ciphertext_buf)
+            .map_err(|e| {
+                error!("KMS GenerateDataKey call failed with error: {:?}", e);
+                e
+            })?;
+        
+        info!("GenerateDataKey successful, plaintext size: {}, ciphertext size: {}", 
+            plaintext_buf.len(), ciphertext_buf.len());
         
         use base64::Engine as _;
         let plaintext_b64 = base64::engine::general_purpose::STANDARD.encode(plaintext_buf.as_slice());
         let ciphertext_b64 = base64::engine::general_purpose::STANDARD.encode(ciphertext_buf.as_slice());
+        
+        info!("Encoded results to base64, plaintext_b64 length: {}, ciphertext_b64 length: {}",
+            plaintext_b64.len(), ciphertext_b64.len());
         
         Ok((plaintext_b64, ciphertext_b64))
     }
@@ -383,7 +422,7 @@ async fn main() -> Result<()> {
     
     // Now get the allocator after initialization
     info!("Getting allocator after library initialization...");
-    let allocator = AwsAllocator::default()
+    let _allocator = AwsAllocator::default()
         .map_err(|e| ServerError::InitializationError(e.to_string()))?;
     
     // Seed entropy
@@ -419,19 +458,35 @@ async fn main() -> Result<()> {
                             Ok(n) => {
                                 match serde_json::from_slice::<Request>(&buffer[..n]) {
                                     Ok(request) => {
-                                        info!("Received operation: {}", request.operation);
+                                        info!("Received operation: {} with {} params", request.operation, request.params.len());
                                         let response = server.handle_request(request).await;
                                         
+                                        // Log response details
+                                        if let Some(ref err) = response.error {
+                                            error!("Operation failed with error: {}", err);
+                                        } else {
+                                            info!("Operation completed successfully");
+                                        }
+                                        
                                         // Send response
-                                        if let Ok(response_bytes) = serde_json::to_vec(&response) {
-                                            if let Err(e) = stream.write_all(&response_bytes).await {
-                                                error!("Failed to send response: {}", e);
-                                                break;
+                                        match serde_json::to_vec(&response) {
+                                            Ok(response_bytes) => {
+                                                info!("Sending response ({} bytes)", response_bytes.len());
+                                                if let Err(e) = stream.write_all(&response_bytes).await {
+                                                    error!("Failed to send response: {}", e);
+                                                    break;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to serialize response: {}", e);
                                             }
                                         }
                                     }
                                     Err(e) => {
-                                        error!("Failed to parse request: {}", e);
+                                        error!("Failed to parse request from {} bytes: {}", n, e);
+                                        let received_str = String::from_utf8_lossy(&buffer[..n]);
+                                        error!("Received data: {}", received_str);
+                                        
                                         let error_response = Response {
                                             error: Some(format!("Invalid request: {}", e)),
                                             plaintext: None,

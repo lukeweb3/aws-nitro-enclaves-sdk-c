@@ -164,34 +164,45 @@ fn read_ciphertext(cli_arg: Option<String>) -> Result<String> {
 
 fn send_request(stream: &mut UnixStream, request: &Request) -> Result<Response> {
     // Send request as JSON without newline (matching enclave's expectation)
-    println!("sending request...");
+    info!("Preparing to send {} request", request.operation);
     let request_bytes = serde_json::to_vec(request)?;
     
     // Debug: log the request
     let request_json = serde_json::to_string_pretty(request)?;
-    println!("Sending request: {}", request_json);
+    info!("Sending request ({} bytes): {}", request_bytes.len(), request_json);
     
     stream.write_all(&request_bytes)?;
     stream.flush()?;
+    info!("Request sent successfully");
     
     // Read response
     let mut response_buffer = vec![0u8; 65536];
+    info!("Waiting for response...");
     let n = stream.read(&mut response_buffer)?;
     
     if n == 0 {
+        error!("Connection closed by server - no data received");
         return Err(ClientError::ServerError("Connection closed by server".to_string()));
     }
     
+    info!("Received {} bytes from server", n);
+    
     // Debug: log the response
     let response_str = String::from_utf8_lossy(&response_buffer[..n]);
-    info!("Received response: {}", response_str);
+    info!("Raw response data: {}", response_str);
     
-    let response: Response = serde_json::from_slice(&response_buffer[..n])?;
+    let response: Response = serde_json::from_slice(&response_buffer[..n])
+        .map_err(|e| {
+            error!("Failed to parse response JSON: {}", e);
+            ClientError::Json(e)
+        })?;
     
-    if let Some(error) = response.error {
-        return Err(ClientError::ServerError(error));
+    if let Some(ref error) = response.error {
+        error!("Server returned error: {}", error);
+        return Err(ClientError::ServerError(error.clone()));
     }
     
+    info!("Response parsed successfully");
     Ok(response)
 }
 
@@ -213,10 +224,22 @@ async fn main() -> Result<()> {
     info!("Connecting to enclave CID {} port {}", cid, cli.port);
     
     // Connect to enclave
-    let mut stream = create_vsock_stream(cid, cli.port)?;
+    info!("Creating vsock connection to CID {} port {}", cid, cli.port);
+    let mut stream = create_vsock_stream(cid, cli.port)
+        .map_err(|e| {
+            error!("Failed to connect to enclave: {}", e);
+            e
+        })?;
+    info!("Successfully connected to enclave");
     
     // Get AWS credentials
-    let (aws_key_id, aws_secret_key, aws_session_token) = get_aws_credentials().await?;
+    info!("Fetching AWS credentials");
+    let (aws_key_id, aws_secret_key, aws_session_token) = get_aws_credentials().await
+        .map_err(|e| {
+            error!("Failed to get AWS credentials: {}", e);
+            e
+        })?;
+    info!("AWS credentials obtained successfully");
     
     // Get region
     let region = cli.region
@@ -288,11 +311,19 @@ async fn main() -> Result<()> {
             }
         },
         "generate-data-key" => {
+            info!("Starting generate-data-key operation");
+            
             // Build GenerateDataKey request
             let mut gen_key_params = HashMap::new();
             
             let key_id = cli.key_id
-                .ok_or_else(|| ClientError::MissingArgument)?;
+                .ok_or_else(|| {
+                    error!("Missing required --key-id argument");
+                    ClientError::MissingArgument
+                })?;
+            info!("Using key_id: {}", key_id);
+            info!("Using key_spec: {}", cli.key_spec);
+            
             gen_key_params.insert("key_id".to_string(), serde_json::Value::String(key_id));
             gen_key_params.insert("key_spec".to_string(), serde_json::Value::String(cli.key_spec));
             
@@ -303,6 +334,18 @@ async fn main() -> Result<()> {
             
             info!("Sending generate data key request");
             let response = send_request(&mut stream, &gen_key_request)?;
+            
+            // Check if we got both plaintext and ciphertext
+            if response.plaintext.is_none() {
+                error!("Server response missing plaintext");
+                return Err(ClientError::ServerError("Response missing plaintext".to_string()));
+            }
+            if response.ciphertext.is_none() {
+                error!("Server response missing ciphertext");
+                return Err(ClientError::ServerError("Response missing ciphertext".to_string()));
+            }
+            
+            info!("GenerateDataKey successful");
             
             // Output as JSON with both plaintext and ciphertext
             let output = serde_json::json!({

@@ -59,6 +59,7 @@ impl AwsAllocator {
 // Safe wrapper for AWS string
 pub struct AwsString {
     string: *mut aws_string,
+    #[allow(dead_code)]
     allocator: *mut aws_allocator,
 }
 
@@ -95,6 +96,7 @@ impl Drop for AwsString {
 // Safe wrapper for AWS byte buffer
 pub struct AwsByteBuffer {
     buffer: aws_byte_buf,
+    #[allow(dead_code)]
     allocator: *mut aws_allocator,
 }
 
@@ -370,7 +372,11 @@ impl KmsClient {
         plaintext: &mut AwsByteBuffer,
         ciphertext: &mut AwsByteBuffer,
     ) -> Result<()> {
+        eprintln!("KmsClient::generate_data_key - Starting generate data key operation");
+        eprintln!("KmsClient::generate_data_key - Key spec: {}", key_spec);
+        
         unsafe {
+            eprintln!("KmsClient::generate_data_key - Calling aws_kms_generate_data_key_blocking");
             let result = aws_kms_generate_data_key_blocking(
                 self.client,
                 key_id.as_ptr(),
@@ -379,9 +385,25 @@ impl KmsClient {
                 ciphertext.as_mut_ptr(),
             );
             
+            eprintln!("KmsClient::generate_data_key - Result: {}", result);
+            
             if result != 0 {
+                eprintln!("KmsClient::generate_data_key - ERROR: Generate data key failed with code {}", result);
+                // Try to get more error info
+                let error_code = aws_last_error();
+                eprintln!("KmsClient::generate_data_key - AWS last error code: {}", error_code);
+                if error_code != 0 {
+                    let error_str = aws_error_debug_str(error_code);
+                    if !error_str.is_null() {
+                        let c_str = std::ffi::CStr::from_ptr(error_str);
+                        eprintln!("KmsClient::generate_data_key - AWS error: {:?}", c_str);
+                    }
+                }
                 return Err(NitroEnclavesError::AwsError(result));
             }
+            
+            eprintln!("KmsClient::generate_data_key - Success, plaintext size: {}, ciphertext size: {}", 
+                plaintext.len(), ciphertext.len());
             Ok(())
         }
     }
