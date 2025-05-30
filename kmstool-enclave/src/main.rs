@@ -78,39 +78,55 @@ impl Server {
             return true; // Already configured
         }
         
-        // Try to get configuration from environment variables
+        info!("Attempting auto-configuration for enclave");
+        
+        // Get region - try environment first, then use a sensible default
         let region = env::var("AWS_DEFAULT_REGION")
             .or_else(|_| env::var("AWS_REGION"))
-            .unwrap_or_else(|_| "us-east-1".to_string()); // Default to us-east-1
+            .unwrap_or_else(|_| {
+                info!("No region in environment, using default: ap-southeast-2");
+                "ap-southeast-2".to_string()
+            });
         
-        let aws_key_id = env::var("AWS_ACCESS_KEY_ID").ok();
-        let aws_secret_key = env::var("AWS_SECRET_ACCESS_KEY").ok();
+        // Try to get credentials from environment variables first
+        let aws_key_id = env::var("AWS_ACCESS_KEY_ID");
+        let aws_secret_key = env::var("AWS_SECRET_ACCESS_KEY");
         let aws_session_token = env::var("AWS_SESSION_TOKEN").ok();
         
-        // If we have credentials, use them
-        if let (Some(key_id), Some(secret_key)) = (aws_key_id, aws_secret_key) {
-            info!("Auto-configuring KMS client from environment variables");
-            info!("Using region: {}", region);
-            
-            let default_key_id = env::var("DEFAULT_KMS_KEY_ID").ok();
-            if let Some(ref key) = default_key_id {
-                info!("Using default KMS key ID: {}", key);
+        let credentials = match (aws_key_id, aws_secret_key) {
+            (Ok(key_id), Ok(secret_key)) => {
+                info!("Found AWS credentials in environment variables");
+                (key_id, secret_key, aws_session_token)
+            },
+            _ => {
+                // If no environment credentials, we need to fail here
+                // In the future, we could try to get credentials from instance metadata
+                // through a vsock proxy, but for now we require explicit credentials
+                error!("No AWS credentials found in environment variables");
+                error!("Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY");
+                return false;
             }
-            
-            let client_info = ClientInfo {
-                region,
-                endpoint: None,
-                port: 443,
-                ca_bundle: None,
-                credentials: (key_id, secret_key, aws_session_token),
-                default_key_id,
-            };
-            
-            *self.client_info.lock().unwrap() = Some(client_info);
-            return true;
+        };
+        
+        info!("Auto-configuring with region: {}", region);
+        
+        let default_key_id = env::var("DEFAULT_KMS_KEY_ID").ok();
+        if let Some(ref key) = default_key_id {
+            info!("Using default KMS key ID: {}", key);
         }
         
-        false
+        let client_info = ClientInfo {
+            region,
+            endpoint: None,
+            port: 8000, // KMS proxy port
+            ca_bundle: None,
+            credentials,
+            default_key_id,
+        };
+        
+        *self.client_info.lock().unwrap() = Some(client_info);
+        info!("Auto-configuration completed");
+        true
     }
     
     fn set_client(&self, params: &HashMap<String, serde_json::Value>) -> Result<()> {
@@ -241,21 +257,24 @@ impl Server {
             .map_err(|e| {
                 error!("Failed to create KMS client: {}", e);
                 // Check if it's a connection error to KMS proxy
-                let error_msg = match e {
+                match e {
                     NitroEnclavesError::NullPointer => {
-                        "KMS proxy connection failed (vsock to CID 3 port 8000). Please ensure:\n\
-                         1. KMS proxy is running on the parent instance (port 8000)\n\
-                         2. Run: sudo netstat -tlnp | grep 8000\n\
-                         3. If not running, start your KMS proxy service"
+                        ServerError::InitializationError(
+                            "KMS proxy connection failed (vsock to CID 3 port 8000). Please ensure:\n\
+                             1. KMS proxy is running on the parent instance (port 8000)\n\
+                             2. Run: sudo netstat -tlnp | grep 8000\n\
+                             3. If not running, start your KMS proxy service".to_string()
+                        )
                     },
                     NitroEnclavesError::AwsError(code) if code == 0 => {
-                        "KMS proxy connection failed. Check if KMS proxy is running on port 8000"
+                        ServerError::InitializationError(
+                            "KMS proxy connection failed. Check if KMS proxy is running on port 8000".to_string()
+                        )
                     },
                     _ => {
-                        return Err(ServerError::InitializationError(format!("KMS client error: {}", e)))
+                        ServerError::InitializationError(format!("KMS client error: {}", e))
                     }
-                };
-                ServerError::InitializationError(error_msg.to_string())
+                }
             })
     }
     

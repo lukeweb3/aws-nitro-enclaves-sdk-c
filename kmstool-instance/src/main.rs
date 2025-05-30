@@ -289,11 +289,12 @@ async fn run() -> Result<()> {
         })?;
     info!("Successfully connected to enclave");
     
-    // Check if we need to send SetClient based on operation and available config
+    // Check if we need to send SetClient based on operation
     let need_set_client = match cli.operation.as_str() {
-        "decrypt" => true, // Decrypt always needs SetClient for now
+        "decrypt" => true, // Decrypt always needs SetClient for backward compatibility
         "encrypt" | "generate-data-key" => {
-            // For encrypt and generate-data-key, only send SetClient if we have explicit config
+            // For these operations, only send SetClient if we have explicit config
+            // Otherwise, let the enclave auto-configure
             cli.region.is_some() || get_region().is_ok() || cli.kms_endpoint.is_some()
         },
         _ => true,
