@@ -118,7 +118,7 @@ WORKDIR /rootfs
 
 RUN BINS="\
     /usr/lib64/libnsm.so \
-    /tmp/crt-builder/aws-nitro-enclaves-sdk-c/rust-nitro-enclaves-kms-tools/target/release/kmstool_enclave \
+    /tmp/crt-builder/target/release/kmstool_enclave \
     " && \
     for bin in $BINS; do \
         { echo "$bin"; ldd "$bin" | grep -Eo "/.*lib.*/[^ ]+"; } | \
@@ -130,7 +130,7 @@ RUN BINS="\
 
 # Also copy the Rust standard library dependencies
 RUN mkdir -p /rootfs/usr/bin && \
-    cp -fL /tmp/crt-builder/aws-nitro-enclaves-sdk-c/rust-nitro-enclaves-kms-tools/target/release/kmstool_enclave /rootfs/usr/bin/
+    cp -fL /tmp/crt-builder/target/release/kmstool_enclave /rootfs/usr/bin/
 
 RUN mkdir -p /rootfs/etc/pki/tls/certs/ \
     && cp -f /etc/pki/tls/certs/* /rootfs/etc/pki/tls/certs/
@@ -153,7 +153,7 @@ FROM $BASE_IMAGE as kmstool-instance-rust
 # TODO: building packages statically instead of cleaning up unwanted packages from amazonlinux
 RUN rpm -e python python-libs python-urlgrabber python2-rpm pygpgme pyliblzma python-iniparse pyxattr python-pycurl amazon-linux-extras yum yum-metadata-parser yum-plugin-ovl yum-plugin-priorities
 COPY --from=builder /usr/lib64/libnsm.so /usr/lib64/libnsm.so
-COPY --from=builder /tmp/crt-builder/aws-nitro-enclaves-sdk-c/rust-nitro-enclaves-kms-tools/target/release/kmstool_instance /kmstool_instance
+COPY --from=builder /tmp/crt-builder/target/release/kmstool_instance /kmstool_instance
 CMD ["/kmstool_instance"]
 
 # kmstool-enclave-cli (Rust version)
@@ -162,7 +162,7 @@ FROM $BASE_IMAGE as kmstool-enclave-cli-rust
 # TODO: building packages statically instead of cleaning up unwanted packages from amazonlinux
 RUN rpm -e python python-libs python-urlgrabber python2-rpm pygpgme pyliblzma python-iniparse pyxattr python-pycurl amazon-linux-extras yum yum-metadata-parser yum-plugin-ovl yum-plugin-priorities
 COPY --from=builder /usr/lib64/libnsm.so /usr/lib64/libnsm.so
-COPY --from=builder /tmp/crt-builder/aws-nitro-enclaves-sdk-c/rust-nitro-enclaves-kms-tools/target/release/kmstool_enclave_cli /kmstool_enclave_cli
+COPY --from=builder /tmp/crt-builder/target/release/kmstool_enclave_cli /kmstool_enclave_cli
 
 # Development stage with all tools
 FROM $BASE_IMAGE as development
@@ -170,7 +170,7 @@ FROM $BASE_IMAGE as development
 # Only copy the shared libraries that actually exist
 COPY --from=builder /usr/lib64/libnsm.so /usr/lib64/libnsm.so
 # Copy the statically linked binaries
-COPY --from=builder /tmp/crt-builder/aws-nitro-enclaves-sdk-c/rust-nitro-enclaves-kms-tools/target/release/kmstool_* /usr/bin/
+COPY --from=builder /tmp/crt-builder/target/release/kmstool_* /usr/bin/
 
 # Install runtime dependencies
 RUN yum install -y \
