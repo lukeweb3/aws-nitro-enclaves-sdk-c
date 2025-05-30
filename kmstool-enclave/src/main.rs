@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::env;
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
@@ -58,6 +59,7 @@ struct ClientInfo {
     #[allow(dead_code)]
     ca_bundle: Option<String>,
     credentials: (String, String, Option<String>),
+    default_key_id: Option<String>,
 }
 
 struct Server {
@@ -69,6 +71,47 @@ impl Server {
         Self {
             client_info: Arc::new(Mutex::new(None)),
         }
+    }
+    
+    fn try_auto_configure(&self) -> bool {
+        // Check if we can auto-configure from environment
+        if self.client_info.lock().unwrap().is_some() {
+            return true; // Already configured
+        }
+        
+        // Try to get configuration from environment variables
+        let region = env::var("AWS_DEFAULT_REGION")
+            .or_else(|_| env::var("AWS_REGION"))
+            .unwrap_or_else(|_| "us-east-1".to_string()); // Default to us-east-1
+        
+        let aws_key_id = env::var("AWS_ACCESS_KEY_ID").ok();
+        let aws_secret_key = env::var("AWS_SECRET_ACCESS_KEY").ok();
+        let aws_session_token = env::var("AWS_SESSION_TOKEN").ok();
+        
+        // If we have credentials, use them
+        if let (Some(key_id), Some(secret_key)) = (aws_key_id, aws_secret_key) {
+            info!("Auto-configuring KMS client from environment variables");
+            info!("Using region: {}", region);
+            
+            let default_key_id = env::var("DEFAULT_KMS_KEY_ID").ok();
+            if let Some(ref key) = default_key_id {
+                info!("Using default KMS key ID: {}", key);
+            }
+            
+            let client_info = ClientInfo {
+                region,
+                endpoint: None,
+                port: 443,
+                ca_bundle: None,
+                credentials: (key_id, secret_key, aws_session_token),
+                default_key_id,
+            };
+            
+            *self.client_info.lock().unwrap() = Some(client_info);
+            return true;
+        }
+        
+        false
     }
     
     fn set_client(&self, params: &HashMap<String, serde_json::Value>) -> Result<()> {
@@ -103,12 +146,17 @@ impl Server {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         
+        let default_key_id = params.get("default_key_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+            
         let client_info = ClientInfo {
             region,
             endpoint,
             port,
             ca_bundle,
             credentials: (aws_key_id, aws_secret_key, aws_session_token),
+            default_key_id,
         };
         
         *self.client_info.lock().unwrap() = Some(client_info);
@@ -117,6 +165,12 @@ impl Server {
     
     fn create_kms_client(&self) -> Result<KmsClient> {
         info!("Creating KMS client");
+        
+        // Try auto-configuration if not already configured
+        if !self.try_auto_configure() {
+            error!("KMS client not configured and auto-configuration failed");
+            return Err(ServerError::ClientNotSet);
+        }
         
         let client_info = self.client_info.lock().unwrap();
         let info = client_info.as_ref().ok_or(ServerError::ClientNotSet)?;
@@ -238,10 +292,16 @@ impl Server {
     fn generate_data_key(&self, params: &HashMap<String, serde_json::Value>) -> Result<(String, String)> {
         info!("GenerateDataKey called with params: {:?}", params);
         
+        // Try to get key_id from params, fall back to default if configured
         let key_id = params.get("key_id")
             .and_then(|v| v.as_str())
+            .or_else(|| {
+                self.client_info.lock().unwrap()
+                    .as_ref()
+                    .and_then(|info| info.default_key_id.as_deref())
+            })
             .ok_or_else(|| {
-                error!("Missing required field: key_id");
+                error!("Missing required field: key_id (and no default key configured)");
                 ServerError::MissingField("key_id".into())
             })?;
             
@@ -320,6 +380,97 @@ impl Server {
         Ok((plaintext_b64, ciphertext_b64))
     }
     
+    fn encrypt(&self, params: &HashMap<String, serde_json::Value>) -> Result<String> {
+        info!("Encrypt called with params: {:?}", params);
+        
+        let plaintext_b64 = params.get("plaintext")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                error!("Missing required field: plaintext");
+                ServerError::MissingField("plaintext".into())
+            })?;
+            
+        // Try to get key_id from params, fall back to default if configured
+        let key_id = params.get("key_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                self.client_info.lock().unwrap()
+                    .as_ref()
+                    .and_then(|info| info.default_key_id.as_deref())
+            })
+            .ok_or_else(|| {
+                error!("Missing required field: key_id (and no default key configured)");
+                ServerError::MissingField("key_id".into())
+            })?;
+            
+        info!("Encrypting with key_id: {}", key_id);
+        
+        info!("Decoding base64 plaintext");
+        use base64::Engine as _;
+        let plaintext_bytes = base64::engine::general_purpose::STANDARD.decode(plaintext_b64)
+            .map_err(|e| {
+                error!("Failed to decode base64 plaintext: {}", e);
+                ServerError::Base64(e)
+            })?;
+        info!("Plaintext decoded, {} bytes", plaintext_bytes.len());
+        
+        info!("Creating allocator for encrypt operation");
+        let allocator = AwsAllocator::default()
+            .map_err(|e| {
+                error!("Failed to create allocator: {:?}", e);
+                e
+            })?;
+        
+        info!("Creating KMS client for encrypt");
+        let client = self.create_kms_client()
+            .map_err(|e| {
+                error!("Failed to create KMS client: {:?}", e);
+                e
+            })?;
+        
+        info!("Creating AWS string for key_id: {}", key_id);
+        let key_id_str = AwsString::new(&allocator, key_id)
+            .map_err(|e| {
+                error!("Failed to create AWS string for key_id: {:?}", e);
+                e
+            })?;
+        
+        info!("Creating byte buffers");
+        let plaintext_buf = AwsByteBuffer::from_slice(&allocator, &plaintext_bytes)
+            .map_err(|e| {
+                error!("Failed to create plaintext buffer: {:?}", e);
+                e
+            })?;
+        let mut ciphertext_buf = AwsByteBuffer::new(&allocator, 8192)
+            .map_err(|e| {
+                error!("Failed to create ciphertext buffer: {:?}", e);
+                e
+            })?;
+        
+        // Check if we have encryption context
+        if let Some(context_value) = params.get("encryption_context") {
+            if let Some(context_str) = context_value.as_str() {
+                info!("Encrypting with encryption context");
+                let context = AwsString::new(&allocator, context_str)?;
+                client.encrypt_with_context(&key_id_str, &plaintext_buf, &context, &mut ciphertext_buf)?;
+            } else {
+                info!("Encrypting without encryption context (context not a string)");
+                client.encrypt(&key_id_str, &plaintext_buf, &mut ciphertext_buf)?;
+            }
+        } else {
+            info!("Encrypting without encryption context");
+            client.encrypt(&key_id_str, &plaintext_buf, &mut ciphertext_buf)
+                .map_err(|e| {
+                    error!("Encrypt failed: {:?}", e);
+                    e
+                })?;
+        }
+        
+        info!("Encrypt successful, ciphertext size: {}", ciphertext_buf.len());
+        
+        Ok(base64::engine::general_purpose::STANDARD.encode(ciphertext_buf.as_slice()))
+    }
+    
     async fn handle_request(&self, request: Request) -> Response {
         match request.operation.as_str() {
             "SetClient" => {
@@ -355,6 +506,20 @@ impl Server {
                     Ok((plaintext, ciphertext)) => Response {
                         error: None,
                         plaintext: Some(plaintext),
+                        ciphertext: Some(ciphertext),
+                    },
+                    Err(e) => Response {
+                        error: Some(e.to_string()),
+                        plaintext: None,
+                        ciphertext: None,
+                    },
+                }
+            },
+            "Encrypt" => {
+                match self.encrypt(&request.params) {
+                    Ok(ciphertext) => Response {
+                        error: None,
+                        plaintext: None,
                         ciphertext: Some(ciphertext),
                     },
                     Err(e) => Response {

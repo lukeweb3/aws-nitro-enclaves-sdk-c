@@ -55,15 +55,19 @@ struct Cli {
     #[arg(long)]
     ca_bundle: Option<String>,
     
-    /// Base64 encoded ciphertext (read from stdin if not provided)
+    /// Base64 encoded ciphertext (for decrypt, read from stdin if not provided)
     #[arg(long)]
     ciphertext: Option<String>,
+    
+    /// Base64 encoded plaintext (for encrypt, read from stdin if not provided)
+    #[arg(long)]
+    plaintext: Option<String>,
     
     /// Encryption context as JSON string
     #[arg(long)]
     encryption_context: Option<String>,
     
-    /// Operation to perform (decrypt or generate-data-key)
+    /// Operation to perform (decrypt, encrypt, or generate-data-key)
     #[arg(long, default_value = "decrypt")]
     operation: String,
     
@@ -162,6 +166,20 @@ fn read_ciphertext(cli_arg: Option<String>) -> Result<String> {
     }
 }
 
+fn read_plaintext(cli_arg: Option<String>) -> Result<String> {
+    if let Some(plaintext) = cli_arg {
+        // If provided as argument, encode to base64
+        use base64::Engine as _;
+        Ok(base64::engine::general_purpose::STANDARD.encode(plaintext.as_bytes()))
+    } else {
+        // Read from stdin and encode to base64
+        let mut buffer = Vec::new();
+        io::stdin().read_to_end(&mut buffer)?;
+        use base64::Engine as _;
+        Ok(base64::engine::general_purpose::STANDARD.encode(&buffer))
+    }
+}
+
 fn send_request(stream: &mut UnixStream, request: &Request) -> Result<Response> {
     // Send request as JSON without newline (matching enclave's expectation)
     info!("Preparing to send {} request", request.operation);
@@ -232,52 +250,72 @@ async fn main() -> Result<()> {
         })?;
     info!("Successfully connected to enclave");
     
-    // Get AWS credentials
-    info!("Fetching AWS credentials");
-    let (aws_key_id, aws_secret_key, aws_session_token) = get_aws_credentials().await
-        .map_err(|e| {
-            error!("Failed to get AWS credentials: {}", e);
-            e
-        })?;
-    info!("AWS credentials obtained successfully");
-    
-    // Get region
-    let region = cli.region
-        .or_else(|| get_region().ok())
-        .ok_or(ClientError::MissingArgument)?;
-    
-    // Load CA bundle if specified
-    let ca_bundle = cli.ca_bundle
-        .map(|path| fs::read_to_string(&path))
-        .transpose()?;
-    
-    // Build SetClient request
-    let mut set_client_params = HashMap::new();
-    set_client_params.insert("region".to_string(), serde_json::Value::String(region));
-    set_client_params.insert("aws_key_id".to_string(), serde_json::Value::String(aws_key_id));
-    set_client_params.insert("aws_secret_key".to_string(), serde_json::Value::String(aws_secret_key));
-    
-    if let Some(token) = aws_session_token {
-        set_client_params.insert("aws_session_token".to_string(), serde_json::Value::String(token));
-    }
-    
-    if let Some(endpoint) = cli.kms_endpoint {
-        set_client_params.insert("endpoint".to_string(), serde_json::Value::String(endpoint));
-    }
-    
-    set_client_params.insert("port".to_string(), serde_json::Value::Number(cli.kms_proxy_port.into()));
-    
-    if let Some(ca) = ca_bundle {
-        set_client_params.insert("ca_bundle".to_string(), serde_json::Value::String(ca));
-    }
-    
-    let set_client_request = Request {
-        operation: "SetClient".to_string(),
-        params: set_client_params,
+    // Check if we need to send SetClient based on operation and available config
+    let need_set_client = match cli.operation.as_str() {
+        "decrypt" => true, // Decrypt always needs SetClient for now
+        "encrypt" | "generate-data-key" => {
+            // For encrypt and generate-data-key, only send SetClient if we have explicit config
+            cli.region.is_some() || get_region().is_ok() || cli.kms_endpoint.is_some()
+        },
+        _ => true,
     };
     
-    info!("Setting KMS client configuration");
-    send_request(&mut stream, &set_client_request)?;
+    if need_set_client {
+        // Get AWS credentials
+        info!("Fetching AWS credentials");
+        let (aws_key_id, aws_secret_key, aws_session_token) = get_aws_credentials().await
+            .map_err(|e| {
+                error!("Failed to get AWS credentials: {}", e);
+                e
+            })?;
+        info!("AWS credentials obtained successfully");
+        
+        // Get region
+        info!("Getting AWS region");
+        let region = cli.region
+            .or_else(|| get_region().ok())
+            .ok_or_else(|| {
+                error!("AWS region not specified. Please provide --region or set AWS_DEFAULT_REGION/AWS_REGION environment variable");
+                ClientError::MissingArgument
+            })?;
+        info!("Using AWS region: {}", region);
+        
+        // Load CA bundle if specified
+        let ca_bundle = cli.ca_bundle
+            .as_ref()
+            .map(|path| fs::read_to_string(path))
+            .transpose()?;
+        
+        // Build SetClient request
+        let mut set_client_params = HashMap::new();
+        set_client_params.insert("region".to_string(), serde_json::Value::String(region));
+        set_client_params.insert("aws_key_id".to_string(), serde_json::Value::String(aws_key_id));
+        set_client_params.insert("aws_secret_key".to_string(), serde_json::Value::String(aws_secret_key));
+        
+        if let Some(token) = aws_session_token {
+            set_client_params.insert("aws_session_token".to_string(), serde_json::Value::String(token));
+        }
+        
+        if let Some(endpoint) = cli.kms_endpoint {
+            set_client_params.insert("endpoint".to_string(), serde_json::Value::String(endpoint));
+        }
+        
+        set_client_params.insert("port".to_string(), serde_json::Value::Number(cli.kms_proxy_port.into()));
+        
+        if let Some(ca) = ca_bundle {
+            set_client_params.insert("ca_bundle".to_string(), serde_json::Value::String(ca));
+        }
+        
+        let set_client_request = Request {
+            operation: "SetClient".to_string(),
+            params: set_client_params,
+        };
+        
+        info!("Setting KMS client configuration");
+        send_request(&mut stream, &set_client_request)?;
+    } else {
+        info!("Skipping SetClient, letting enclave auto-configure from environment");
+    }
     
     // Perform the requested operation
     match cli.operation.as_str() {
@@ -308,6 +346,43 @@ async fn main() -> Result<()> {
                     .map_err(|e| ClientError::ServerError(format!("Invalid base64: {}", e)))?;
                 io::stdout().write_all(&plaintext)?;
                 io::stdout().flush()?;
+            }
+        },
+        "encrypt" => {
+            info!("Starting encrypt operation");
+            
+            // Read plaintext
+            let plaintext = read_plaintext(cli.plaintext)?;
+            
+            // Build Encrypt request
+            let mut encrypt_params = HashMap::new();
+            encrypt_params.insert("plaintext".to_string(), serde_json::Value::String(plaintext));
+            
+            // Key ID is optional if enclave has default key configured
+            if let Some(key_id) = cli.key_id {
+                encrypt_params.insert("key_id".to_string(), serde_json::Value::String(key_id));
+            } else {
+                info!("No key_id provided, will use enclave default if configured");
+            }
+            
+            if let Some(context) = cli.encryption_context {
+                encrypt_params.insert("encryption_context".to_string(), serde_json::Value::String(context));
+            }
+            
+            let encrypt_request = Request {
+                operation: "Encrypt".to_string(),
+                params: encrypt_params,
+            };
+            
+            info!("Sending encrypt request");
+            let response = send_request(&mut stream, &encrypt_request)?;
+            
+            // Output ciphertext
+            if let Some(ciphertext_b64) = response.ciphertext {
+                println!("{}", ciphertext_b64);
+            } else {
+                error!("Server response missing ciphertext");
+                return Err(ClientError::ServerError("Response missing ciphertext".to_string()));
             }
         },
         "generate-data-key" => {

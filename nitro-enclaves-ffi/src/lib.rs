@@ -422,6 +422,69 @@ impl KmsClient {
             Ok(())
         }
     }
+    
+    pub fn encrypt(
+        &self,
+        key_id: &AwsString,
+        plaintext: &AwsByteBuffer,
+        ciphertext: &mut AwsByteBuffer,
+    ) -> Result<()> {
+        eprintln!("KmsClient::encrypt - Starting encrypt operation");
+        eprintln!("KmsClient::encrypt - Plaintext size: {}", plaintext.len());
+        
+        unsafe {
+            eprintln!("KmsClient::encrypt - Calling aws_kms_encrypt_blocking");
+            let result = aws_kms_encrypt_blocking(
+                self.client,
+                key_id.as_ptr(),
+                &plaintext.buffer as *const _,
+                ciphertext.as_mut_ptr(),
+            );
+            
+            eprintln!("KmsClient::encrypt - Result: {}", result);
+            
+            if result != 0 {
+                eprintln!("KmsClient::encrypt - ERROR: Encrypt failed with code {}", result);
+                // Try to get more error info
+                let error_code = aws_last_error();
+                eprintln!("KmsClient::encrypt - AWS last error code: {}", error_code);
+                if error_code != 0 {
+                    let error_str = aws_error_debug_str(error_code);
+                    if !error_str.is_null() {
+                        let c_str = std::ffi::CStr::from_ptr(error_str);
+                        eprintln!("KmsClient::encrypt - AWS error: {:?}", c_str);
+                    }
+                }
+                return Err(NitroEnclavesError::AwsError(result));
+            }
+            
+            eprintln!("KmsClient::encrypt - Success, ciphertext size: {}", ciphertext.len());
+            Ok(())
+        }
+    }
+    
+    pub fn encrypt_with_context(
+        &self,
+        key_id: &AwsString,
+        plaintext: &AwsByteBuffer,
+        encryption_context: &AwsString,
+        ciphertext: &mut AwsByteBuffer,
+    ) -> Result<()> {
+        unsafe {
+            let result = aws_kms_encrypt_blocking_with_context(
+                self.client,
+                key_id.as_ptr(),
+                &plaintext.buffer as *const _,
+                encryption_context.as_ptr(),
+                ciphertext.as_mut_ptr(),
+            );
+            
+            if result != 0 {
+                return Err(NitroEnclavesError::AwsError(result));
+            }
+            Ok(())
+        }
+    }
 }
 
 impl Drop for KmsClient {
