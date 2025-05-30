@@ -1,0 +1,181 @@
+# Copyright 2020-2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+ARG BASE_IMAGE=public.ecr.aws/amazonlinux/amazonlinux:2
+
+FROM $BASE_IMAGE as builder
+
+RUN yum install -y \
+	cmake3 \
+	gcc \
+	git \
+	tar \
+	make \
+	gcc-c++ \
+	go \
+	ninja-build \
+	doxygen \
+	clang \
+	clang-devel \
+	llvm-devel \
+	openssl-devel
+
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable
+
+# We keep the build artifacts in the -build directory
+WORKDIR /tmp/crt-builder
+
+RUN git clone --depth 1 -b v1.12.0 https://github.com/awslabs/aws-lc.git aws-lc
+RUN cmake3 -DCMAKE_PREFIX_PATH=/usr -DCMAKE_INSTALL_PREFIX=/usr -GNinja \
+    -DBUILD_TESTING=0 -DBUILD_SHARED_LIBS=OFF \
+    -S aws-lc -B aws-lc/build .
+RUN go env -w GOPROXY=direct
+RUN cmake3 --build aws-lc/build --parallel $(nproc) --target install
+# List installed libraries for debugging
+RUN ls -la /usr/lib64/lib*.a | grep -E "(crypto|ssl|aws-lc)" || true
+
+RUN git clone --depth 1 -b v1.3.46 https://github.com/aws/s2n-tls.git
+RUN cmake3 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr \
+    -DBUILD_SHARED_LIBS=OFF -S s2n-tls -B s2n-tls/build
+RUN cmake3 --build s2n-tls/build --parallel $(nproc) --target install
+
+RUN git clone --depth 1 -b v0.8.0 https://github.com/awslabs/aws-c-common.git
+RUN cmake3 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr -GNinja -S aws-c-common -B aws-c-common/build
+RUN cmake3 --build aws-c-common/build --parallel $(nproc) --target install
+
+RUN git clone --depth 1 -b v0.1.2 https://github.com/awslabs/aws-c-sdkutils.git
+RUN cmake3 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr -GNinja -S aws-c-sdkutils -B aws-c-sdkutils/build
+RUN cmake3 --build aws-c-sdkutils/build --parallel $(nproc) --target install
+
+RUN git clone --depth 1 -b v0.5.18 https://github.com/awslabs/aws-c-cal.git
+RUN cmake3 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr -GNinja -S aws-c-cal -B aws-c-cal/build
+RUN cmake3 --build aws-c-cal/build --parallel $(nproc) --target install
+
+RUN git clone --depth 1 -b v0.11.0 https://github.com/awslabs/aws-c-io.git
+RUN cmake3 -DUSE_VSOCK=1 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr -GNinja -S aws-c-io -B aws-c-io/build
+RUN cmake3 --build aws-c-io/build --parallel $(nproc) --target install
+
+RUN git clone --depth 1 -b v0.2.14 http://github.com/awslabs/aws-c-compression.git
+RUN cmake3 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr -GNinja -S aws-c-compression -B aws-c-compression/build
+RUN cmake3 --build aws-c-compression/build --parallel $(nproc) --target install
+
+RUN git clone --depth 1 -b v0.7.6 https://github.com/awslabs/aws-c-http.git
+RUN cmake3 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr -GNinja -S aws-c-http -B aws-c-http/build
+RUN cmake3 --build aws-c-http/build --parallel $(nproc) --target install
+
+RUN git clone --depth 1 -b v0.6.15 https://github.com/awslabs/aws-c-auth.git
+RUN cmake3 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr -GNinja -S aws-c-auth -B aws-c-auth/build
+RUN cmake3 --build aws-c-auth/build --parallel $(nproc) --target install
+
+RUN git clone --depth 1 -b json-c-0.16-20220414 https://github.com/json-c/json-c.git
+RUN cmake3 -DCMAKE_PREFIX_PATH=/usr -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_SHARED_LIBS=OFF -GNinja -S json-c -B json-c/build
+RUN cmake3 --build json-c/build --parallel $(nproc)  --target install
+
+RUN git clone --depth 1 -b v0.4.0 https://github.com/aws/aws-nitro-enclaves-nsm-api.git
+RUN source $HOME/.cargo/env && cd aws-nitro-enclaves-nsm-api && cargo build --release --jobs $(nproc) -p nsm-lib
+RUN mv aws-nitro-enclaves-nsm-api/target/release/libnsm.so /usr/lib64
+RUN mv aws-nitro-enclaves-nsm-api/target/release/nsm.h /usr/include
+
+# Build the C SDK library for Rust FFI
+COPY libs aws-nitro-enclaves-sdk-c
+RUN cmake3 -DCMAKE_PREFIX_PATH=/usr -DCMAKE_INSTALL_PREFIX=/usr -GNinja \
+	-DBUILD_SHARED_LIBS=OFF \
+	-S aws-nitro-enclaves-sdk-c -B aws-nitro-enclaves-sdk-c/build
+RUN cmake3 --build aws-nitro-enclaves-sdk-c/build --parallel $(nproc) --target install
+# List all static libraries for debugging
+RUN echo "=== Installed static libraries ===" && ls -la /usr/lib64/*.a | head -20
+
+# Build Rust tools
+COPY Cargo.toml Cargo.lock build.sh docker-build.sh docker-build-fresh.sh ./
+COPY kmstool-enclave-cli ./kmstool-enclave-cli/
+COPY kmstool-enclave ./kmstool-enclave/
+COPY kmstool-instance ./kmstool-instance/
+COPY nitro-enclaves-ffi ./nitro-enclaves-ffi/
+WORKDIR /tmp/crt-builder
+
+# Install additional Rust dependencies
+RUN source $HOME/.cargo/env && cargo install bindgen-cli
+
+# Add pkg-config path for finding libraries
+ENV PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/lib/pkgconfig
+
+# Set library path for runtime linking
+ENV LD_LIBRARY_PATH=/usr/lib64:/usr/lib:$LD_LIBRARY_PATH
+ENV LIBRARY_PATH=/usr/lib64:/usr/lib:$LIBRARY_PATH
+
+# Build the Rust tools
+# Set SSL cert location for AWS SDK
+ENV SSL_CERT_FILE=/etc/pki/tls/certs/ca-bundle.crt
+ENV SSL_CERT_DIR=/etc/pki/tls/certs
+
+RUN source $HOME/.cargo/env && \
+    BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include" \
+    cargo build --release
+
+# Prepare rootfs for kmstool-enclave
+RUN mkdir -p /rootfs
+WORKDIR /rootfs
+
+RUN BINS="\
+    /usr/lib64/libnsm.so \
+    /tmp/crt-builder/aws-nitro-enclaves-sdk-c/rust-nitro-enclaves-kms-tools/target/release/kmstool_enclave \
+    " && \
+    for bin in $BINS; do \
+        { echo "$bin"; ldd "$bin" | grep -Eo "/.*lib.*/[^ ]+"; } | \
+            while read path; do \
+                mkdir -p ".$(dirname $path)"; \
+                cp -fL "$path" ".$path"; \
+            done \
+    done
+
+# Also copy the Rust standard library dependencies
+RUN mkdir -p /rootfs/usr/bin && \
+    cp -fL /tmp/crt-builder/aws-nitro-enclaves-sdk-c/rust-nitro-enclaves-kms-tools/target/release/kmstool_enclave /rootfs/usr/bin/
+
+RUN mkdir -p /rootfs/etc/pki/tls/certs/ \
+    && cp -f /etc/pki/tls/certs/* /rootfs/etc/pki/tls/certs/
+RUN find /rootfs
+
+# kmstool-enclave (Rust version)
+FROM scratch as kmstool-enclave-rust
+
+COPY --from=builder /rootfs /
+
+ARG REGION
+ARG ENDPOINT
+ENV REGION=${REGION}
+ENV ENDPOINT=${ENDPOINT}
+CMD ["/usr/bin/kmstool_enclave"]
+
+# kmstool-instance (Rust version)
+FROM $BASE_IMAGE as kmstool-instance-rust
+
+# TODO: building packages statically instead of cleaning up unwanted packages from amazonlinux
+RUN rpm -e python python-libs python-urlgrabber python2-rpm pygpgme pyliblzma python-iniparse pyxattr python-pycurl amazon-linux-extras yum yum-metadata-parser yum-plugin-ovl yum-plugin-priorities
+COPY --from=builder /usr/lib64/libnsm.so /usr/lib64/libnsm.so
+COPY --from=builder /tmp/crt-builder/aws-nitro-enclaves-sdk-c/rust-nitro-enclaves-kms-tools/target/release/kmstool_instance /kmstool_instance
+CMD ["/kmstool_instance"]
+
+# kmstool-enclave-cli (Rust version)
+FROM $BASE_IMAGE as kmstool-enclave-cli-rust
+
+# TODO: building packages statically instead of cleaning up unwanted packages from amazonlinux
+RUN rpm -e python python-libs python-urlgrabber python2-rpm pygpgme pyliblzma python-iniparse pyxattr python-pycurl amazon-linux-extras yum yum-metadata-parser yum-plugin-ovl yum-plugin-priorities
+COPY --from=builder /usr/lib64/libnsm.so /usr/lib64/libnsm.so
+COPY --from=builder /tmp/crt-builder/aws-nitro-enclaves-sdk-c/rust-nitro-enclaves-kms-tools/target/release/kmstool_enclave_cli /kmstool_enclave_cli
+
+# Development stage with all tools
+FROM $BASE_IMAGE as development
+
+# Only copy the shared libraries that actually exist
+COPY --from=builder /usr/lib64/libnsm.so /usr/lib64/libnsm.so
+# Copy the statically linked binaries
+COPY --from=builder /tmp/crt-builder/aws-nitro-enclaves-sdk-c/rust-nitro-enclaves-kms-tools/target/release/kmstool_* /usr/bin/
+
+# Install runtime dependencies
+RUN yum install -y \
+    openssl \
+    ca-certificates \
+    && yum clean all
+
+WORKDIR /app

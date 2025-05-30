@@ -1,0 +1,21 @@
+[package]
+name = "kmstool-enclave"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kmstool_enclave"
+path = "src/main.rs"
+
+[dependencies]
+nitro-enclaves-ffi = { path = "../nitro-enclaves-ffi" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+base64 = { workspace = true }
+libc = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread"] }
