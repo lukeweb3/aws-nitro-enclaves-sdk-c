@@ -28,6 +28,8 @@ enum ServerError {
     InitializationError(String),
     #[error("Missing required field: {0}")]
     MissingField(String),
+    #[error("Invalid parameter: {0}")]
+    InvalidParameter(String),
 }
 
 type Result<T> = std::result::Result<T, ServerError>;
@@ -45,6 +47,8 @@ struct Response {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     plaintext: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ciphertext: Option<String>,
 }
 
 struct ClientInfo {
@@ -54,6 +58,7 @@ struct ClientInfo {
     #[allow(dead_code)]
     ca_bundle: Option<String>,
     credentials: (String, String, Option<String>),
+    default_key_id: Option<String>,
 }
 
 struct Server {
@@ -65,6 +70,66 @@ impl Server {
         Self {
             client_info: Arc::new(Mutex::new(None)),
         }
+    }
+    
+    fn try_auto_configure(&self) -> bool {
+        // Check if we can auto-configure from environment
+        if self.client_info.lock().unwrap().is_some() {
+            return true; // Already configured
+        }
+        
+        info!("Attempting auto-configuration for enclave");
+        
+        // Get region - try environment first, then use a sensible default
+        let region = env::var("AWS_DEFAULT_REGION")
+            .or_else(|_| env::var("AWS_REGION"))
+            .unwrap_or_else(|_| {
+                info!("No region in environment, using default: ap-southeast-2");
+                "ap-southeast-2".to_string()
+            });
+        
+        // Try to get credentials from environment variables first
+        let aws_key_id = env::var("AWS_ACCESS_KEY_ID");
+        let aws_secret_key = env::var("AWS_SECRET_ACCESS_KEY");
+        let aws_session_token = env::var("AWS_SESSION_TOKEN").ok();
+        
+        let credentials = match (aws_key_id, aws_secret_key) {
+            (Ok(key_id), Ok(secret_key)) => {
+                info!("Found AWS credentials in environment variables");
+                (key_id, secret_key, aws_session_token)
+            },
+            _ => {
+                // If no environment credentials, try to use placeholder for IAM role
+                info!("No AWS credentials in environment, attempting to use IAM role");
+                info!("Note: This requires KMS proxy to handle authentication");
+                // Use placeholder credentials - actual auth will be done by KMS proxy
+                (
+                    "placeholder-for-iam-role".to_string(),
+                    "placeholder-for-iam-role".to_string(),
+                    None
+                )
+            }
+        };
+        
+        info!("Auto-configuring with region: {}", region);
+        
+        let default_key_id = env::var("DEFAULT_KMS_KEY_ID").ok();
+        if let Some(ref key) = default_key_id {
+            info!("Using default KMS key ID: {}", key);
+        }
+        
+        let client_info = ClientInfo {
+            region,
+            endpoint: None,
+            port: 8000, // KMS proxy port
+            ca_bundle: None,
+            credentials,
+            default_key_id,
+        };
+        
+        *self.client_info.lock().unwrap() = Some(client_info);
+        info!("Auto-configuration completed");
+        true
     }
     
     fn set_client(&self, params: &HashMap<String, serde_json::Value>) -> Result<()> {
@@ -99,12 +164,17 @@ impl Server {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         
+        let default_key_id = params.get("default_key_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+            
         let client_info = ClientInfo {
             region,
             endpoint,
             port,
             ca_bundle,
             credentials: (aws_key_id, aws_secret_key, aws_session_token),
+            default_key_id,
         };
         
         *self.client_info.lock().unwrap() = Some(client_info);
@@ -114,6 +184,23 @@ impl Server {
     fn create_kms_client(&self) -> Result<KmsClient> {
         info!("Creating KMS client");
         
+        // Check if already configured
+        {
+            let client_info = self.client_info.lock().unwrap();
+            if client_info.is_some() {
+                info!("Using configuration from SetClient");
+            } else {
+                // Not configured, need to auto-configure
+                drop(client_info); // Release the lock before calling try_auto_configure
+                if !self.try_auto_configure() {
+                    error!("KMS client not configured and auto-configuration failed");
+                    return Err(ServerError::ClientNotSet);
+                }
+                info!("Auto-configuration completed");
+            }
+        }
+        
+        // Now get the configuration (guaranteed to exist)
         let client_info = self.client_info.lock().unwrap();
         let info = client_info.as_ref().ok_or(ServerError::ClientNotSet)?;
         
@@ -132,19 +219,19 @@ impl Server {
                 ServerError::InitializationError(format!("Region string error: {}", e))
             })?;
         
-        let access_key_id = AwsString::new(&allocator, &info.credentials.0)
+        let _access_key_id = AwsString::new(&allocator, &info.credentials.0)
             .map_err(|e| {
                 error!("Failed to create access_key_id string: {}", e);
                 ServerError::InitializationError(format!("Access key string error: {}", e))
             })?;
             
-        let secret_access_key = AwsString::new(&allocator, &info.credentials.1)
+        let _secret_access_key = AwsString::new(&allocator, &info.credentials.1)
             .map_err(|e| {
                 error!("Failed to create secret_access_key string: {}", e);
                 ServerError::InitializationError(format!("Secret key string error: {}", e))
             })?;
             
-        let session_token = info.credentials.2.as_ref()
+        let _session_token = info.credentials.2.as_ref()
             .map(|t| AwsString::new(&allocator, t))
             .transpose()
             .map_err(|e| {
@@ -183,7 +270,25 @@ impl Server {
         KmsClient::new(config)
             .map_err(|e| {
                 error!("Failed to create KMS client: {}", e);
-                ServerError::InitializationError(format!("Client creation error: {}", e))
+                // Check if it's a connection error to KMS proxy
+                match e {
+                    NitroEnclavesError::NullPointer => {
+                        ServerError::InitializationError(
+                            "KMS proxy connection failed (vsock to CID 3 port 8000). Please ensure:\n\
+                             1. KMS proxy is running on the parent instance (port 8000)\n\
+                             2. Run: sudo netstat -tlnp | grep 8000\n\
+                             3. If not running, start your KMS proxy service".to_string()
+                        )
+                    },
+                    NitroEnclavesError::AwsError(code) if code == 0 => {
+                        ServerError::InitializationError(
+                            "KMS proxy connection failed. Check if KMS proxy is running on port 8000".to_string()
+                        )
+                    },
+                    _ => {
+                        ServerError::InitializationError(format!("KMS client error: {}", e))
+                    }
+                }
             })
     }
     
@@ -231,17 +336,218 @@ impl Server {
         Ok(base64::engine::general_purpose::STANDARD.encode(plaintext_buf.as_slice()))
     }
     
+    fn generate_data_key(&self, params: &HashMap<String, serde_json::Value>) -> Result<(String, String)> {
+        info!("GenerateDataKey called with params: {:?}", params);
+        
+        // Try to get key_id from params, fall back to default if configured
+        let key_id_string = if let Some(key) = params.get("key_id").and_then(|v| v.as_str()) {
+            key.to_string()
+        } else {
+            // Try to get default key from client info
+            let client_info = self.client_info.lock().unwrap();
+            client_info
+                .as_ref()
+                .and_then(|info| info.default_key_id.clone())
+                .ok_or_else(|| {
+                    error!("Missing required field: key_id (and no default key configured)");
+                    ServerError::MissingField("key_id".into())
+                })?
+        };
+        
+        let key_id = key_id_string.as_str();
+            
+        let key_spec = params.get("key_spec")
+            .and_then(|v| v.as_str())
+            .unwrap_or("AES_256");
+            
+        info!("Generating data key with key_id: {}, key_spec: {}", key_id, key_spec);
+        
+        info!("Creating allocator for generate data key operation");
+        let allocator = AwsAllocator::default()
+            .map_err(|e| {
+                error!("Failed to create allocator: {:?}", e);
+                e
+            })?;
+        
+        info!("Creating KMS client for generate data key");
+        let client = self.create_kms_client()
+            .map_err(|e| {
+                error!("Failed to create KMS client: {:?}", e);
+                e
+            })?;
+        
+        // Convert key_spec string to enum
+        let key_spec_enum = match key_spec {
+            "AES_128" => {
+                info!("Using AES_128 key spec (value: 1)");
+                1 // AWS_KS_AES_128
+            },
+            "AES_256" => {
+                info!("Using AES_256 key spec (value: 0)");
+                0 // AWS_KS_AES_256
+            },
+            _ => {
+                error!("Invalid key_spec provided: {}", key_spec);
+                return Err(ServerError::InvalidParameter(format!("Invalid key_spec: {}. Must be AES_128 or AES_256", key_spec)))
+            },
+        };
+        
+        info!("Creating AWS string for key_id: {}", key_id);
+        let key_id_str = AwsString::new(&allocator, &key_id_string)
+            .map_err(|e| {
+                error!("Failed to create AWS string for key_id: {:?}", e);
+                e
+            })?;
+        
+        info!("Creating byte buffers for output");
+        let mut plaintext_buf = AwsByteBuffer::new(&allocator, 4096)
+            .map_err(|e| {
+                error!("Failed to create plaintext buffer: {:?}", e);
+                e
+            })?;
+        let mut ciphertext_buf = AwsByteBuffer::new(&allocator, 4096)
+            .map_err(|e| {
+                error!("Failed to create ciphertext buffer: {:?}", e);
+                e
+            })?;
+        
+        info!("Calling KMS generate_data_key with key_spec_enum: {}", key_spec_enum);
+        client.generate_data_key(&key_id_str, key_spec_enum, &mut plaintext_buf, &mut ciphertext_buf)
+            .map_err(|e| {
+                error!("KMS GenerateDataKey call failed with error: {:?}", e);
+                e
+            })?;
+        
+        info!("GenerateDataKey successful, plaintext size: {}, ciphertext size: {}", 
+            plaintext_buf.len(), ciphertext_buf.len());
+        
+        use base64::Engine as _;
+        let plaintext_b64 = base64::engine::general_purpose::STANDARD.encode(plaintext_buf.as_slice());
+        let ciphertext_b64 = base64::engine::general_purpose::STANDARD.encode(ciphertext_buf.as_slice());
+        
+        info!("Encoded results to base64, plaintext_b64 length: {}, ciphertext_b64 length: {}",
+            plaintext_b64.len(), ciphertext_b64.len());
+        
+        Ok((plaintext_b64, ciphertext_b64))
+    }
+    
+    fn encrypt(&self, params: &HashMap<String, serde_json::Value>) -> Result<String> {
+        info!("Encrypt called with params: {:?}", params);
+        
+        let plaintext_b64 = params.get("plaintext")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                error!("Missing required field: plaintext");
+                ServerError::MissingField("plaintext".into())
+            })?;
+            
+        // Try to get key_id from params, fall back to default if configured
+        let key_id_string = if let Some(key) = params.get("key_id").and_then(|v| v.as_str()) {
+            key.to_string()
+        } else {
+            // Try to get default key from client info
+            let client_info = self.client_info.lock().unwrap();
+            client_info
+                .as_ref()
+                .and_then(|info| info.default_key_id.clone())
+                .ok_or_else(|| {
+                    error!("Missing required field: key_id (and no default key configured)");
+                    ServerError::MissingField("key_id".into())
+                })?
+        };
+        
+        let key_id = key_id_string.as_str();
+            
+        info!("Encrypting with key_id: {}", key_id);
+        
+        info!("Decoding base64 plaintext");
+        use base64::Engine as _;
+        let plaintext_bytes = base64::engine::general_purpose::STANDARD.decode(plaintext_b64)
+            .map_err(|e| {
+                error!("Failed to decode base64 plaintext: {}", e);
+                ServerError::Base64(e)
+            })?;
+        info!("Plaintext decoded, {} bytes", plaintext_bytes.len());
+        
+        info!("Creating allocator for encrypt operation");
+        let allocator = AwsAllocator::default()
+            .map_err(|e| {
+                error!("Failed to create allocator: {:?}", e);
+                e
+            })?;
+        
+        info!("Creating KMS client for encrypt");
+        let client = self.create_kms_client()
+            .map_err(|e| {
+                error!("Failed to create KMS client: {:?}", e);
+                e
+            })?;
+        
+        info!("Creating AWS string for key_id: {}", key_id);
+        let key_id_str = AwsString::new(&allocator, &key_id_string)
+            .map_err(|e| {
+                error!("Failed to create AWS string for key_id: {:?}", e);
+                e
+            })?;
+        
+        info!("Creating byte buffers");
+        let plaintext_buf = AwsByteBuffer::from_slice(&allocator, &plaintext_bytes)
+            .map_err(|e| {
+                error!("Failed to create plaintext buffer: {:?}", e);
+                e
+            })?;
+        let mut ciphertext_buf = AwsByteBuffer::new(&allocator, 8192)
+            .map_err(|e| {
+                error!("Failed to create ciphertext buffer: {:?}", e);
+                e
+            })?;
+        
+        // Check if we have encryption context
+        if let Some(context_value) = params.get("encryption_context") {
+            if let Some(context_str) = context_value.as_str() {
+                info!("Encrypting with encryption context");
+                let context = AwsString::new(&allocator, context_str)?;
+                client.encrypt_with_context(&key_id_str, &plaintext_buf, &context, &mut ciphertext_buf)?;
+            } else {
+                info!("Encrypting without encryption context (context not a string)");
+                client.encrypt(&key_id_str, &plaintext_buf, &mut ciphertext_buf)?;
+            }
+        } else {
+            info!("Encrypting without encryption context");
+            client.encrypt(&key_id_str, &plaintext_buf, &mut ciphertext_buf)
+                .map_err(|e| {
+                    error!("Encrypt failed: {:?}", e);
+                    e
+                })?;
+        }
+        
+        info!("Encrypt successful, ciphertext size: {}", ciphertext_buf.len());
+        
+        Ok(base64::engine::general_purpose::STANDARD.encode(ciphertext_buf.as_slice()))
+    }
+    
     async fn handle_request(&self, request: Request) -> Response {
         match request.operation.as_str() {
+            "CheckClient" => {
+                let client_info = self.client_info.lock().unwrap();
+                let is_configured = client_info.is_some();
+                Response {
+                    error: None,
+                    plaintext: Some(if is_configured { "configured" } else { "not_configured" }.to_string()),
+                    ciphertext: None,
+                }
+            },
             "SetClient" => {
                 match self.set_client(&request.params) {
                     Ok(_) => Response {
                         error: None,
                         plaintext: None,
+                        ciphertext: None,
                     },
                     Err(e) => Response {
                         error: Some(e.to_string()),
                         plaintext: None,
+                        ciphertext: None,
                     },
                 }
             },
@@ -250,16 +556,47 @@ impl Server {
                     Ok(plaintext) => Response {
                         error: None,
                         plaintext: Some(plaintext),
+                        ciphertext: None,
                     },
                     Err(e) => Response {
                         error: Some(e.to_string()),
                         plaintext: None,
+                        ciphertext: None,
+                    },
+                }
+            },
+            "GenerateDataKey" => {
+                match self.generate_data_key(&request.params) {
+                    Ok((plaintext, ciphertext)) => Response {
+                        error: None,
+                        plaintext: Some(plaintext),
+                        ciphertext: Some(ciphertext),
+                    },
+                    Err(e) => Response {
+                        error: Some(e.to_string()),
+                        plaintext: None,
+                        ciphertext: None,
+                    },
+                }
+            },
+            "Encrypt" => {
+                match self.encrypt(&request.params) {
+                    Ok(ciphertext) => Response {
+                        error: None,
+                        plaintext: None,
+                        ciphertext: Some(ciphertext),
+                    },
+                    Err(e) => Response {
+                        error: Some(e.to_string()),
+                        plaintext: None,
+                        ciphertext: None,
                     },
                 }
             },
             _ => Response {
                 error: Some("Invalid operation".to_string()),
                 plaintext: None,
+                ciphertext: None,
             },
         }
     }
@@ -314,7 +651,7 @@ async fn main() -> Result<()> {
     
     // Now get the allocator after initialization
     info!("Getting allocator after library initialization...");
-    let allocator = AwsAllocator::default()
+    let _allocator = AwsAllocator::default()
         .map_err(|e| ServerError::InitializationError(e.to_string()))?;
     
     // Seed entropy
@@ -350,22 +687,39 @@ async fn main() -> Result<()> {
                             Ok(n) => {
                                 match serde_json::from_slice::<Request>(&buffer[..n]) {
                                     Ok(request) => {
-                                        info!("Received operation: {}", request.operation);
+                                        info!("Received operation: {} with {} params", request.operation, request.params.len());
                                         let response = server.handle_request(request).await;
                                         
+                                        // Log response details
+                                        if let Some(ref err) = response.error {
+                                            error!("Operation failed with error: {}", err);
+                                        } else {
+                                            info!("Operation completed successfully");
+                                        }
+                                        
                                         // Send response
-                                        if let Ok(response_bytes) = serde_json::to_vec(&response) {
-                                            if let Err(e) = stream.write_all(&response_bytes).await {
-                                                error!("Failed to send response: {}", e);
-                                                break;
+                                        match serde_json::to_vec(&response) {
+                                            Ok(response_bytes) => {
+                                                info!("Sending response ({} bytes)", response_bytes.len());
+                                                if let Err(e) = stream.write_all(&response_bytes).await {
+                                                    error!("Failed to send response: {}", e);
+                                                    break;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to serialize response: {}", e);
                                             }
                                         }
                                     }
                                     Err(e) => {
-                                        error!("Failed to parse request: {}", e);
+                                        error!("Failed to parse request from {} bytes: {}", n, e);
+                                        let received_str = String::from_utf8_lossy(&buffer[..n]);
+                                        error!("Received data: {}", received_str);
+                                        
                                         let error_response = Response {
                                             error: Some(format!("Invalid request: {}", e)),
                                             plaintext: None,
+                                            ciphertext: None,
                                         };
                                         if let Ok(response_bytes) = serde_json::to_vec(&error_response) {
                                             let _ = stream.write_all(&response_bytes).await;

@@ -59,6 +59,7 @@ impl AwsAllocator {
 // Safe wrapper for AWS string
 pub struct AwsString {
     string: *mut aws_string,
+    #[allow(dead_code)]
     allocator: *mut aws_allocator,
 }
 
@@ -95,6 +96,7 @@ impl Drop for AwsString {
 // Safe wrapper for AWS byte buffer
 pub struct AwsByteBuffer {
     buffer: aws_byte_buf,
+    #[allow(dead_code)]
     allocator: *mut aws_allocator,
 }
 
@@ -275,9 +277,11 @@ impl KmsClient {
             
             if client.is_null() {
                 eprintln!("KmsClient::new - ERROR: Client is null!");
+                
                 // Try to get AWS error
                 let error_code = aws_last_error();
                 eprintln!("KmsClient::new - AWS last error code: {}", error_code);
+                
                 if error_code != 0 {
                     let error_str = aws_error_debug_str(error_code);
                     if !error_str.is_null() {
@@ -288,6 +292,7 @@ impl KmsClient {
                     }
                 } else {
                     eprintln!("KmsClient::new - No AWS error code set");
+                    eprintln!("KmsClient::new - This usually means vsock connection to KMS proxy failed");
                 }
                 return Err(NitroEnclavesError::NullPointer);
             }
@@ -370,7 +375,11 @@ impl KmsClient {
         plaintext: &mut AwsByteBuffer,
         ciphertext: &mut AwsByteBuffer,
     ) -> Result<()> {
+        eprintln!("KmsClient::generate_data_key - Starting generate data key operation");
+        eprintln!("KmsClient::generate_data_key - Key spec: {}", key_spec);
+        
         unsafe {
+            eprintln!("KmsClient::generate_data_key - Calling aws_kms_generate_data_key_blocking");
             let result = aws_kms_generate_data_key_blocking(
                 self.client,
                 key_id.as_ptr(),
@@ -379,9 +388,25 @@ impl KmsClient {
                 ciphertext.as_mut_ptr(),
             );
             
+            eprintln!("KmsClient::generate_data_key - Result: {}", result);
+            
             if result != 0 {
+                eprintln!("KmsClient::generate_data_key - ERROR: Generate data key failed with code {}", result);
+                // Try to get more error info
+                let error_code = aws_last_error();
+                eprintln!("KmsClient::generate_data_key - AWS last error code: {}", error_code);
+                if error_code != 0 {
+                    let error_str = aws_error_debug_str(error_code);
+                    if !error_str.is_null() {
+                        let c_str = std::ffi::CStr::from_ptr(error_str);
+                        eprintln!("KmsClient::generate_data_key - AWS error: {:?}", c_str);
+                    }
+                }
                 return Err(NitroEnclavesError::AwsError(result));
             }
+            
+            eprintln!("KmsClient::generate_data_key - Success, plaintext size: {}, ciphertext size: {}", 
+                plaintext.len(), ciphertext.len());
             Ok(())
         }
     }
@@ -392,6 +417,69 @@ impl KmsClient {
                 self.client,
                 num_bytes,
                 output.as_mut_ptr(),
+            );
+            
+            if result != 0 {
+                return Err(NitroEnclavesError::AwsError(result));
+            }
+            Ok(())
+        }
+    }
+    
+    pub fn encrypt(
+        &self,
+        key_id: &AwsString,
+        plaintext: &AwsByteBuffer,
+        ciphertext: &mut AwsByteBuffer,
+    ) -> Result<()> {
+        eprintln!("KmsClient::encrypt - Starting encrypt operation");
+        eprintln!("KmsClient::encrypt - Plaintext size: {}", plaintext.len());
+        
+        unsafe {
+            eprintln!("KmsClient::encrypt - Calling aws_kms_encrypt_blocking");
+            let result = aws_kms_encrypt_blocking(
+                self.client,
+                key_id.as_ptr(),
+                &plaintext.buffer as *const _,
+                ciphertext.as_mut_ptr(),
+            );
+            
+            eprintln!("KmsClient::encrypt - Result: {}", result);
+            
+            if result != 0 {
+                eprintln!("KmsClient::encrypt - ERROR: Encrypt failed with code {}", result);
+                // Try to get more error info
+                let error_code = aws_last_error();
+                eprintln!("KmsClient::encrypt - AWS last error code: {}", error_code);
+                if error_code != 0 {
+                    let error_str = aws_error_debug_str(error_code);
+                    if !error_str.is_null() {
+                        let c_str = std::ffi::CStr::from_ptr(error_str);
+                        eprintln!("KmsClient::encrypt - AWS error: {:?}", c_str);
+                    }
+                }
+                return Err(NitroEnclavesError::AwsError(result));
+            }
+            
+            eprintln!("KmsClient::encrypt - Success, ciphertext size: {}", ciphertext.len());
+            Ok(())
+        }
+    }
+    
+    pub fn encrypt_with_context(
+        &self,
+        key_id: &AwsString,
+        plaintext: &AwsByteBuffer,
+        encryption_context: &AwsString,
+        ciphertext: &mut AwsByteBuffer,
+    ) -> Result<()> {
+        unsafe {
+            let result = aws_kms_encrypt_blocking_with_context(
+                self.client,
+                key_id.as_ptr(),
+                &plaintext.buffer as *const _,
+                encryption_context.as_ptr(),
+                ciphertext.as_mut_ptr(),
             );
             
             if result != 0 {
