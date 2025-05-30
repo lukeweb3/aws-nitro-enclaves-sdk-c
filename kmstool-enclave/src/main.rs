@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::env;
 use std::io;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
@@ -293,17 +292,21 @@ impl Server {
         info!("GenerateDataKey called with params: {:?}", params);
         
         // Try to get key_id from params, fall back to default if configured
-        let key_id = params.get("key_id")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                self.client_info.lock().unwrap()
-                    .as_ref()
-                    .and_then(|info| info.default_key_id.as_deref())
-            })
-            .ok_or_else(|| {
-                error!("Missing required field: key_id (and no default key configured)");
-                ServerError::MissingField("key_id".into())
-            })?;
+        let key_id_string = if let Some(key) = params.get("key_id").and_then(|v| v.as_str()) {
+            key.to_string()
+        } else {
+            // Try to get default key from client info
+            let client_info = self.client_info.lock().unwrap();
+            client_info
+                .as_ref()
+                .and_then(|info| info.default_key_id.clone())
+                .ok_or_else(|| {
+                    error!("Missing required field: key_id (and no default key configured)");
+                    ServerError::MissingField("key_id".into())
+                })?
+        };
+        
+        let key_id = key_id_string.as_str();
             
         let key_spec = params.get("key_spec")
             .and_then(|v| v.as_str())
@@ -342,7 +345,7 @@ impl Server {
         };
         
         info!("Creating AWS string for key_id: {}", key_id);
-        let key_id_str = AwsString::new(&allocator, key_id)
+        let key_id_str = AwsString::new(&allocator, &key_id_string)
             .map_err(|e| {
                 error!("Failed to create AWS string for key_id: {:?}", e);
                 e
@@ -391,17 +394,21 @@ impl Server {
             })?;
             
         // Try to get key_id from params, fall back to default if configured
-        let key_id = params.get("key_id")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                self.client_info.lock().unwrap()
-                    .as_ref()
-                    .and_then(|info| info.default_key_id.as_deref())
-            })
-            .ok_or_else(|| {
-                error!("Missing required field: key_id (and no default key configured)");
-                ServerError::MissingField("key_id".into())
-            })?;
+        let key_id_string = if let Some(key) = params.get("key_id").and_then(|v| v.as_str()) {
+            key.to_string()
+        } else {
+            // Try to get default key from client info
+            let client_info = self.client_info.lock().unwrap();
+            client_info
+                .as_ref()
+                .and_then(|info| info.default_key_id.clone())
+                .ok_or_else(|| {
+                    error!("Missing required field: key_id (and no default key configured)");
+                    ServerError::MissingField("key_id".into())
+                })?
+        };
+        
+        let key_id = key_id_string.as_str();
             
         info!("Encrypting with key_id: {}", key_id);
         
@@ -429,7 +436,7 @@ impl Server {
             })?;
         
         info!("Creating AWS string for key_id: {}", key_id);
-        let key_id_str = AwsString::new(&allocator, key_id)
+        let key_id_str = AwsString::new(&allocator, &key_id_string)
             .map_err(|e| {
                 error!("Failed to create AWS string for key_id: {:?}", e);
                 e
