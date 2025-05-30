@@ -45,6 +45,8 @@ struct Response {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     plaintext: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ciphertext: Option<String>,
 }
 
 struct ClientInfo {
@@ -231,6 +233,54 @@ impl Server {
         Ok(base64::engine::general_purpose::STANDARD.encode(plaintext_buf.as_slice()))
     }
     
+    fn generate_data_key(&self, params: &HashMap<String, serde_json::Value>) -> Result<(String, String)> {
+        info!("GenerateDataKey called with params: {:?}", params);
+        
+        let key_id = params.get("key_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ServerError::MissingField("key_id".into()))?;
+            
+        let key_spec = params.get("key_spec")
+            .and_then(|v| v.as_str())
+            .unwrap_or("AES_256");
+            
+        info!("Generating data key with key_id: {}, key_spec: {}", key_id, key_spec);
+        
+        info!("Creating allocator for generate data key operation");
+        let allocator = AwsAllocator::default()?;
+        
+        info!("Creating KMS client for generate data key");
+        let client = self.create_kms_client()?;
+        
+        // Convert key_spec string to enum
+        use nitro_enclaves_ffi::aws_key_spec;
+        let key_spec_enum = match key_spec {
+            "AES_128" => aws_key_spec::AWS_KS_AES_128,
+            "AES_256" => aws_key_spec::AWS_KS_AES_256,
+            _ => return Err(ServerError::InvalidParameter),
+        };
+        
+        info!("Creating AWS string for key_id");
+        let key_id_str = AwsString::new(&allocator, key_id)?;
+        
+        info!("Creating byte buffers for output");
+        let mut plaintext_buf = AwsByteBuffer::new(&allocator, 4096)?;
+        let mut ciphertext_buf = AwsByteBuffer::new(&allocator, 4096)?;
+        
+        info!("Calling generate_data_key");
+        client.generate_data_key(&key_id_str, key_spec_enum, &mut plaintext_buf, &mut ciphertext_buf)
+            .map_err(|e| {
+                error!("GenerateDataKey failed: {}", e);
+                e
+            })?;
+        
+        use base64::Engine as _;
+        let plaintext_b64 = base64::engine::general_purpose::STANDARD.encode(plaintext_buf.as_slice());
+        let ciphertext_b64 = base64::engine::general_purpose::STANDARD.encode(ciphertext_buf.as_slice());
+        
+        Ok((plaintext_b64, ciphertext_b64))
+    }
+    
     async fn handle_request(&self, request: Request) -> Response {
         match request.operation.as_str() {
             "SetClient" => {
@@ -238,10 +288,12 @@ impl Server {
                     Ok(_) => Response {
                         error: None,
                         plaintext: None,
+                        ciphertext: None,
                     },
                     Err(e) => Response {
                         error: Some(e.to_string()),
                         plaintext: None,
+                        ciphertext: None,
                     },
                 }
             },
@@ -250,16 +302,33 @@ impl Server {
                     Ok(plaintext) => Response {
                         error: None,
                         plaintext: Some(plaintext),
+                        ciphertext: None,
                     },
                     Err(e) => Response {
                         error: Some(e.to_string()),
                         plaintext: None,
+                        ciphertext: None,
+                    },
+                }
+            },
+            "GenerateDataKey" => {
+                match self.generate_data_key(&request.params) {
+                    Ok((plaintext, ciphertext)) => Response {
+                        error: None,
+                        plaintext: Some(plaintext),
+                        ciphertext: Some(ciphertext),
+                    },
+                    Err(e) => Response {
+                        error: Some(e.to_string()),
+                        plaintext: None,
+                        ciphertext: None,
                     },
                 }
             },
             _ => Response {
                 error: Some("Invalid operation".to_string()),
                 plaintext: None,
+                ciphertext: None,
             },
         }
     }
@@ -366,6 +435,7 @@ async fn main() -> Result<()> {
                                         let error_response = Response {
                                             error: Some(format!("Invalid request: {}", e)),
                                             plaintext: None,
+                                            ciphertext: None,
                                         };
                                         if let Ok(response_bytes) = serde_json::to_vec(&error_response) {
                                             let _ = stream.write_all(&response_bytes).await;

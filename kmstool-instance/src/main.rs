@@ -62,6 +62,18 @@ struct Cli {
     /// Encryption context as JSON string
     #[arg(long)]
     encryption_context: Option<String>,
+    
+    /// Operation to perform (decrypt or generate-data-key)
+    #[arg(long, default_value = "decrypt")]
+    operation: String,
+    
+    /// Key ID for generate-data-key operation
+    #[arg(long)]
+    key_id: Option<String>,
+    
+    /// Key spec for generate-data-key operation (AES_128 or AES_256)
+    #[arg(long, default_value = "AES_256")]
+    key_spec: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -77,6 +89,8 @@ struct Response {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     plaintext: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ciphertext: Option<String>,
 }
 
 fn create_vsock_stream(cid: u32, port: u32) -> io::Result<UnixStream> {
@@ -242,32 +256,65 @@ async fn main() -> Result<()> {
     info!("Setting KMS client configuration");
     send_request(&mut stream, &set_client_request)?;
     
-    // Read ciphertext
-    let ciphertext = read_ciphertext(cli.ciphertext)?;
-    
-    // Build Decrypt request
-    let mut decrypt_params = HashMap::new();
-    decrypt_params.insert("ciphertext".to_string(), serde_json::Value::String(ciphertext));
-    
-    if let Some(context) = cli.encryption_context {
-        decrypt_params.insert("encryption_context".to_string(), serde_json::Value::String(context));
-    }
-    
-    let decrypt_request = Request {
-        operation: "Decrypt".to_string(),
-        params: decrypt_params,
-    };
-    
-    info!("Sending decrypt request");
-    let response = send_request(&mut stream, &decrypt_request)?;
-    
-    // Output plaintext
-    if let Some(plaintext_b64) = response.plaintext {
-        use base64::Engine as _;
-        let plaintext = base64::engine::general_purpose::STANDARD.decode(plaintext_b64)
-            .map_err(|e| ClientError::ServerError(format!("Invalid base64: {}", e)))?;
-        io::stdout().write_all(&plaintext)?;
-        io::stdout().flush()?;
+    // Perform the requested operation
+    match cli.operation.as_str() {
+        "decrypt" => {
+            // Read ciphertext
+            let ciphertext = read_ciphertext(cli.ciphertext)?;
+            
+            // Build Decrypt request
+            let mut decrypt_params = HashMap::new();
+            decrypt_params.insert("ciphertext".to_string(), serde_json::Value::String(ciphertext));
+            
+            if let Some(context) = cli.encryption_context {
+                decrypt_params.insert("encryption_context".to_string(), serde_json::Value::String(context));
+            }
+            
+            let decrypt_request = Request {
+                operation: "Decrypt".to_string(),
+                params: decrypt_params,
+            };
+            
+            info!("Sending decrypt request");
+            let response = send_request(&mut stream, &decrypt_request)?;
+            
+            // Output plaintext
+            if let Some(plaintext_b64) = response.plaintext {
+                use base64::Engine as _;
+                let plaintext = base64::engine::general_purpose::STANDARD.decode(plaintext_b64)
+                    .map_err(|e| ClientError::ServerError(format!("Invalid base64: {}", e)))?;
+                io::stdout().write_all(&plaintext)?;
+                io::stdout().flush()?;
+            }
+        },
+        "generate-data-key" => {
+            // Build GenerateDataKey request
+            let mut gen_key_params = HashMap::new();
+            
+            let key_id = cli.key_id
+                .ok_or_else(|| ClientError::MissingArgument)?;
+            gen_key_params.insert("key_id".to_string(), serde_json::Value::String(key_id));
+            gen_key_params.insert("key_spec".to_string(), serde_json::Value::String(cli.key_spec));
+            
+            let gen_key_request = Request {
+                operation: "GenerateDataKey".to_string(),
+                params: gen_key_params,
+            };
+            
+            info!("Sending generate data key request");
+            let response = send_request(&mut stream, &gen_key_request)?;
+            
+            // Output as JSON with both plaintext and ciphertext
+            let output = serde_json::json!({
+                "plaintext": response.plaintext,
+                "ciphertext": response.ciphertext,
+            });
+            
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        },
+        _ => {
+            return Err(ClientError::ServerError(format!("Unknown operation: {}", cli.operation)));
+        }
     }
     
     Ok(())
